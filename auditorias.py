@@ -1,224 +1,252 @@
-%%writefile pdf_reader.py
 """
-pdf_reader.py
-=============
-
-Puerta de entrada del pipeline: convierte un archivo PDF escaneado en
-una secuencia de imagenes (arrays de NumPy, convencion de color BGR de
-OpenCV), una por cada pagina, listas para que `image_processing.py` las
-procese.
-
-Este modulo NO sabe nada sobre tablas, celdas ni evaluaciones. Su unica
-responsabilidad es la conversion PDF -> imagenes. Esto permite que, si
-en el futuro cambiara la fuente de entrada (por ejemplo, fotos sueltas
-en vez de un PDF escaneado), solo este modulo necesite reescribirse.
-
-DEPENDENCIA DE SISTEMA
------------------------
-`pdf2image` es una envoltura de Python sobre el binario `poppler-utils`
-(especificamente `pdftoppm`), que NO es un paquete de Python: es un
-programa del sistema operativo. En Google Colab debe instalarse con:
-
-    !apt-get install -y poppler-utils
-    !pip install pdf2image
-
-antes de poder usar este modulo.
+app.py
+======
+Interfaz Gráfica Web Interactiva con Streamlit para el Sistema OCR de Auditorías 5S.
+Permite cargar PDFs/imágenes, inspeccionar el preprocesamiento de visión artificial,
+visualizar gráficos radar de madurez 5S y descargar reportes en Excel y JSON.
 """
 
 from __future__ import annotations
 
-import logging
+import io
+import json
 from pathlib import Path
-from typing import Iterator
+import tempfile
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
-from pdf2image import convert_from_path
-from PIL import Image
+import pandas as pd
+import streamlit as st
 
-from config import APLICAR_ROTACION_FIJA, RESOLUCION, ROTACION_FIJA_GRADOS
-from utils import ErrorLecturaPDF, medir_tiempo
-
-logger = logging.getLogger(__name__)
-
-
-def _convertir_pil_a_bgr(imagen_pil: Image.Image) -> np.ndarray:
-    """
-    Convierte una imagen PIL (formato RGB, tal como la entrega
-    `pdf2image`) a un array de NumPy en formato BGR (convencion que usa
-    OpenCV en todo el resto del pipeline).
-
-    Este es el unico lugar del proyecto donde ocurre esta conversion:
-    resolverla aqui, en la frontera de entrada del sistema, evita que
-    cada modulo posterior tenga que acordarse de hacerlo por su cuenta.
-
-    Args:
-        imagen_pil: Imagen en formato PIL, modo RGB.
-
-    Returns:
-        Array de NumPy de forma (alto, ancho, 3) en orden de canales BGR.
-    """
-    if imagen_pil.mode != "RGB":
-        imagen_pil = imagen_pil.convert("RGB")
-
-    arreglo_rgb = np.array(imagen_pil)
-    arreglo_bgr = arreglo_rgb[:, :, ::-1]
-    return arreglo_bgr
+from evaluacion_5s import calcular_evaluacion_5s
+from generador_muestras import generar_hoja_auditoria_sintetica
+from image_processing import (
+    corregir_inclinacion,
+    detectar_estructura_tabla,
+    resaltar_celdas_detectadas
+)
+from ocr_engine import procesar_hoja_auditoria
+from pdf_reader import leer_archivo_documento
+from utils import exportar_auditoria_excel
 
 
-def _corregir_orientacion_escaneo(imagen_bgr: np.ndarray) -> np.ndarray:
-    """
-    Aplica la rotacion fija de escaneo definida en `config.py`.
+def crear_grafico_radar_5s(pilares: dict) -> plt.Figure:
+    """Genera un gráfico de radar / telaraña con los puntajes porcentuales de las 5S."""
+    categorias = ["1S: Clasificar", "2S: Ordenar", "3S: Limpiar", "4S: Estandarizar", "5S: Disciplina"]
+    claves = ["1S", "2S", "3S", "4S", "5S"]
+    valores = [pilares.get(k, {}).get("porcentaje", 0) for k in claves]
+    
+    valores += valores[:1]
+    angulos = np.linspace(0, 2 * np.pi, len(categorias), endpoint=False).tolist()
+    angulos += angulos[:1]
 
-    A diferencia de la correccion de pequena rotacion que hace
-    `image_processing.py` (+/-5, para compensar una hoja mal alineada
-    al escanear), esta funcion corrige una rotacion GRANDE y FIJA
-    (90), producto de como el escaner/alimentador capturo fisicamente
-    las hojas -- igual en todas las paginas del documento.
+    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+    
+    ax.plot(angulos, valores, color="#1E88E5", linewidth=2.5, linestyle="solid")
+    ax.fill(angulos, valores, color="#1E88E5", alpha=0.35)
 
-    Args:
-        imagen_bgr: Imagen recien convertida a BGR, en la orientacion
-            cruda tal como la entrego el escaner.
+    ax.plot(angulos, [85] * len(angulos), color="#43A047", linewidth=1.5, linestyle="--", label="Meta (85%)")
 
-    Returns:
-        Imagen rotada a la orientacion correcta si
-        `config.APLICAR_ROTACION_FIJA` es True; si es False, devuelve
-        la imagen sin modificar.
-    """
-    if not APLICAR_ROTACION_FIJA:
-        return imagen_bgr
-
-    mapa_rotaciones = {
-        90: cv2.ROTATE_90_CLOCKWISE,
-        -90: cv2.ROTATE_90_COUNTERCLOCKWISE,
-        180: cv2.ROTATE_180,
-    }
-    codigo_rotacion = mapa_rotaciones.get(ROTACION_FIJA_GRADOS)
-    if codigo_rotacion is None:
-        raise ErrorLecturaPDF(
-            f"ROTACION_FIJA_GRADOS={ROTACION_FIJA_GRADOS} no es un valor "
-            f"soportado. Use 90, -90 o 180."
-        )
-    return cv2.rotate(imagen_bgr, codigo_rotacion)
+    ax.set_xticks(angulos[:-1])
+    ax.set_xticklabels(categorias, size=11, weight="bold", color="#2E3A59")
+    ax.set_ylim(0, 100)
+    ax.set_yticks([20, 40, 60, 80, 100])
+    ax.set_yticklabels(["20%", "40%", "60%", "80%", "100%"], size=9, color="#666666")
+    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
+    ax.grid(True, linestyle=":", alpha=0.6)
+    
+    plt.tight_layout()
+    return fig
 
 
-def obtener_numero_paginas(ruta_pdf: str) -> int:
-    """
-    Obtiene el numero total de paginas de un PDF sin cargar sus
-    imagenes en memoria.
+def main():
+    st.set_page_config(
+        page_title="Sistema OCR Auditorías 5S",
+        page_icon="📋",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
 
-    Args:
-        ruta_pdf: Ruta al archivo PDF.
+    st.title("📋 Sistema Local de Reconocimiento Óptico (OCR) para Auditorías 5S")
+    st.markdown(
+        "Herramienta inteligente de visión por computadora y OCR para digitalizar, "
+        "evaluar y generar diagnósticos automáticos de planillas de auditoría 5S."
+    )
 
-    Returns:
-        Numero total de paginas del documento.
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Parámetros del Sistema")
+        dpi = st.slider("Resolución de Escaneo (DPI)", min_value=150, max_value=400, value=300, step=50)
+        aplicar_deskew = st.checkbox("Corrección de Inclinación (Deskew)", value=True)
+        
+        st.markdown("---")
+        st.subheader("🧪 Muestra de Prueba")
+        if st.button("📄 Generar y Cargar Muestra Sintética", use_container_width=True):
+            with st.spinner("Generando planilla 5S de prueba..."):
+                generar_hoja_auditoria_sintetica("demo_auditoria_5s.png", "demo_auditoria_5s.pdf")
+                st.session_state["archivo_demo"] = "demo_auditoria_5s.pdf"
+                st.success("Muestra creada con éxito.")
 
-    Raises:
-        ErrorLecturaPDF: Si el archivo no existe o no es un PDF valido.
-    """
-    ruta = Path(ruta_pdf)
-    if not ruta.is_file():
-        raise ErrorLecturaPDF(f"El archivo PDF no existe: {ruta_pdf}")
+    # File Uploader
+    archivo_subido = st.file_uploader(
+        "Seleccione un archivo PDF o Imagen escaneada (.png, .jpg, .tiff)",
+        type=["pdf", "png", "jpg", "jpeg", "tiff", "bmp"]
+    )
 
-    try:
-        from pdf2image.pdf2image import pdfinfo_from_path
+    ruta_a_procesar = None
 
-        info = pdfinfo_from_path(str(ruta))
-        return int(info["Pages"])
-    except Exception as error:
-        raise ErrorLecturaPDF(
-            f"No se pudo leer la informacion del PDF '{ruta_pdf}': {error}"
-        ) from error
+    if archivo_subido is not None:
+        temp_dir = tempfile.mkdtemp()
+        ruta_temp = Path(temp_dir) / archivo_subido.name
+        with open(ruta_temp, "wb") as f:
+            f.write(archivo_subido.getbuffer())
+        ruta_a_procesar = ruta_temp
+    elif "archivo_demo" in st.session_state and Path(st.session_state["archivo_demo"]).exists():
+        ruta_a_procesar = Path(st.session_state["archivo_demo"])
+        st.info("📌 Utilizando la planilla sintética de prueba pregenerada.")
 
+    if ruta_a_procesar is None:
+        st.warning("👈 Por favor cargue una planilla de auditoría o presione 'Generar y Cargar Muestra Sintética' en la barra lateral.")
+        return
 
-@medir_tiempo
-def leer_paginas_pdf(
-    ruta_pdf: str, dpi: int | None = None
-) -> Iterator[tuple[int, np.ndarray]]:
-    """
-    Generador que entrega, una a la vez, cada pagina del PDF convertida
-    a imagen en formato NumPy/BGR.
-
-    Args:
-        ruta_pdf: Ruta al archivo PDF a procesar.
-        dpi: Resolucion a la que se rasteriza cada pagina. Si es None,
-            se usa `config.RESOLUCION.dpi_esperado` (300 por defecto).
-
-    Yields:
-        Tuplas (numero_pagina, imagen).
-
-    Raises:
-        ErrorLecturaPDF: Si el archivo no existe, esta corrupto, o
-            `pdf2image`/`poppler` fallan al convertir alguna pagina.
-    """
-    ruta = Path(ruta_pdf)
-    if not ruta.is_file():
-        raise ErrorLecturaPDF(f"El archivo PDF no existe: {ruta_pdf}")
-
-    dpi_a_usar = dpi if dpi is not None else RESOLUCION.dpi_esperado
-    logger.info("Iniciando lectura de '%s' a %d dpi", ruta_pdf, dpi_a_usar)
-
-    total_paginas = obtener_numero_paginas(str(ruta))
-    if total_paginas == 0:
-        raise ErrorLecturaPDF(f"El PDF '{ruta_pdf}' no contiene paginas.")
-
-    logger.info("El PDF contiene %d pagina(s)", total_paginas)
-
-    for numero_pagina in range(1, total_paginas + 1):
+    # Pipeline
+    with st.spinner("Procesando documento con el pipeline OCR..."):
         try:
-            paginas_convertidas = convert_from_path(
-                str(ruta),
-                dpi=dpi_a_usar,
-                first_page=numero_pagina,
-                last_page=numero_pagina,
-            )
-        except Exception as error:
-            raise ErrorLecturaPDF(
-                f"Fallo al convertir la pagina {numero_pagina} de "
-                f"'{ruta_pdf}': {error}"
-            ) from error
+            paginas = list(leer_archivo_documento(ruta_a_procesar, dpi=dpi))
+            if not paginas:
+                st.error("No se pudo extraer ninguna imagen del archivo.")
+                return
 
-        if not paginas_convertidas:
-            raise ErrorLecturaPDF(
-                f"La pagina {numero_pagina} no produjo ninguna imagen."
+            num_pag, img_bgr = paginas[0]
+
+            if aplicar_deskew:
+                img_procesada, angulo = corregir_inclinacion(img_bgr)
+            else:
+                img_procesada, angulo = img_bgr, 0.0
+
+            rejilla, celdas = detectar_estructura_tabla(img_procesada)
+            img_celdas = resaltar_celdas_detectadas(img_procesada, celdas)
+
+            datos_ocr = procesar_hoja_auditoria(img_procesada, celdas_detectadas=celdas)
+            evaluacion = calcular_evaluacion_5s(datos_ocr)
+
+        except Exception as e:
+            st.error(f"Error durante el procesamiento: {e}")
+            return
+
+    # Paneles
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 Diagnóstico y Resultados 5S",
+        "📝 Detalle de Criterios",
+        "👁️ Visión Artificial y OCR",
+        "💾 Exportar Reportes"
+    ])
+
+    with tab1:
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Área Auditada", evaluacion.get("area"))
+        col_m2.metric("Auditor", evaluacion.get("auditor"))
+        col_m3.metric("Fecha", evaluacion.get("fecha"))
+        col_m4.metric("Turno", evaluacion.get("turno"))
+
+        st.markdown("---")
+
+        col_g1, col_g2, col_g3, col_g4 = st.columns(4)
+        pct = evaluacion.get("porcentaje_global", 0)
+        col_g1.metric("Cumplimiento 5S", f"{pct}%")
+        col_g2.metric("Puntos Obtenidos", f"{evaluacion.get('puntos_totales')} / {evaluacion.get('puntos_maximos')}")
+        col_g3.metric("Ítems Conformes", f"{evaluacion.get('items_conformes')} / {evaluacion.get('total_items')}")
+        
+        estado = evaluacion.get("estado", "")
+        if "EXCELENTE" in estado:
+            col_g4.success(f"🟢 {estado}")
+        elif "OBSERVACIONES" in estado:
+            col_g4.warning(f"🟡 {estado}")
+        else:
+            col_g4.error(f"🔴 {estado}")
+
+        col_chart1, col_chart2 = st.columns([1, 1])
+
+        with col_chart1:
+            st.subheader("Radar de Madurez 5S")
+            fig_radar = crear_grafico_radar_5s(evaluacion.get("pilares", {}))
+            st.pyplot(fig_radar)
+
+        with col_chart2:
+            st.subheader("Cumplimiento por Dimensión")
+            for k, p in evaluacion.get("pilares", {}).items():
+                st.write(f"**{p['nombre']}** ({p['porcentaje']}%)")
+                st.progress(int(p["porcentaje"]))
+
+            st.markdown("### Recomendación Estratégica")
+            st.info(evaluacion.get("recomendacion_principal"))
+
+    with tab2:
+        st.subheader("Planilla Detallada de Criterios Evaluados")
+        df_detalle = pd.DataFrame(evaluacion.get("detalle_items", []))
+        if not df_detalle.empty:
+            columnas_ver = ["codigo", "pilar", "criterio", "puntuacion", "estado_item", "observaciones"]
+            st.dataframe(
+                df_detalle[columnas_ver],
+                column_config={
+                    "codigo": "Código",
+                    "pilar": "Pilar",
+                    "criterio": "Criterio Evaluado",
+                    "puntuacion": st.column_config.NumberColumn("Puntaje (0-4)", format="%d ⭐"),
+                    "estado_item": "Estado",
+                    "observaciones": "Observaciones"
+                },
+                use_container_width=True,
+                hide_index=True
             )
 
-        imagen_bgr = _convertir_pil_a_bgr(paginas_convertidas[0])
-        imagen_bgr = _corregir_orientacion_escaneo(imagen_bgr)
-        logger.debug(
-            "Pagina %d/%d convertida: %dx%d px",
-            numero_pagina,
-            total_paginas,
-            imagen_bgr.shape[1],
-            imagen_bgr.shape[0],
-        )
-        yield numero_pagina, imagen_bgr
+    with tab3:
+        st.subheader("Pipeline de Visión por Computadora")
+        col_v1, col_v2 = st.columns(2)
+        
+        with col_v1:
+            st.image(
+                cv2.cvtColor(img_procesada, cv2.COLOR_BGR2RGB),
+                caption=f"Página Rasterizada (Inclinación ajustada: {angulo:.2f}°)",
+                use_container_width=True
+            )
+
+        with col_v2:
+            st.image(
+                cv2.cvtColor(img_celdas, cv2.COLOR_BGR2RGB),
+                caption=f"Rejilla y Celdas Detectadas ({len(celdas)} celdas)",
+                use_container_width=True
+            )
+
+    with tab4:
+        st.subheader("Descarga de Reportes y Datos")
+        
+        ruta_temp_excel = Path("temp_reporte.xlsx")
+        exportar_auditoria_excel(evaluacion, ruta_temp_excel)
+        with open(ruta_temp_excel, "rb") as f:
+            excel_bytes = f.read()
+
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.download_button(
+                label="📥 Descargar Reporte Completo en Excel (.xlsx)",
+                data=excel_bytes,
+                file_name=f"Reporte_Auditoria_5S_{evaluacion.get('fecha')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
+        with col_d2:
+            json_str = json.dumps(evaluacion, ensure_ascii=False, indent=2)
+            st.download_button(
+                label="📥 Descargar Diagnóstico en JSON",
+                data=json_str,
+                file_name=f"Diagnostico_5S_{evaluacion.get('fecha')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
 
 
 if __name__ == "__main__":
-    import sys
-
-    from config import configurar_logging
-
-    configurar_logging(logging.INFO)
-
-    ruta_prueba = "test_muestra.pdf"
-    if not Path(ruta_prueba).is_file():
-        print(
-            f"AVISO: no se encontro '{ruta_prueba}' en este directorio. "
-            "Coloca un PDF de prueba con ese nombre para ejecutar esta "
-            "prueba manual."
-        )
-        sys.exit(0)
-
-    print(f"\nNumero de paginas detectadas: {obtener_numero_paginas(ruta_prueba)}")
-
-    print("\n--- Leyendo paginas ---")
-    for numero, imagen in leer_paginas_pdf(ruta_prueba):
-        print(
-            f"Pagina {numero}: forma={imagen.shape}, "
-            f"dtype={imagen.dtype}, "
-            f"valor min/max={imagen.min()}/{imagen.max()}"
-        )
-
-    print("\npdf_reader.py se ejecuto sin errores.")
+    main()
