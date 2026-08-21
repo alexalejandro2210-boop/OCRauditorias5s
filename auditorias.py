@@ -94,7 +94,7 @@ def extraer_paginas_pdf(archivo_bytes: bytes, extension: str) -> List[Tuple[np.n
 
 
 # ==========================================
-# 3. EXTRACCIÓN DE METADATOS
+# 3. EXTRACCIÓN DE METADATOS (SIN CONFUSIÓN CON TÍTULOS)
 # ==========================================
 
 def corregir_orientacion(imagen_bgr: np.ndarray) -> np.ndarray:
@@ -124,7 +124,7 @@ def corregir_orientacion(imagen_bgr: np.ndarray) -> np.ndarray:
 
 
 def ocr_texto_completo(imagen_bgr: np.ndarray) -> str:
-    """Ejecuta OCR sobre la cabecera y cuerpo de la imagen."""
+    """Ejecuta OCR sobre la cabecera de la imagen."""
     try:
         import pytesseract
         alto = imagen_bgr.shape[0]
@@ -140,55 +140,63 @@ def ocr_texto_completo(imagen_bgr: np.ndarray) -> str:
 
 
 def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[str, Any]:
-    """Extrae el Área, Línea real y Semana del documento."""
+    """Extrae el Área, Línea real y Semana del documento, filtrando títulos."""
     texto_total = texto_nativo + "\n" + ocr_texto_completo(imagen_bgr)
     
+    # Limpiar del texto el título general "PROGRAMA DE 5'S EN LÍNEAS DE PRODUCCIÓN"
+    texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5['\s]*S\s+EN\s+L[IÍ]NEAS\s+DE\s+PRODUCCI[OÓ]N", "", texto_total, flags=re.IGNORECASE)
+    texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5S\s+EN\s+LINEAS\s+DE\s+PRODUCCION", "", texto_sin_titulo, flags=re.IGNORECASE)
+    texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5['\s]*S", "", texto_sin_titulo, flags=re.IGNORECASE)
+
     # 1. ÁREA (FA, BE, SMT)
     area_res = "FA"
-    m_area = re.search(r"(?:[AÁ]rea|Area)\s*[:\-\.]?\s*([A-Za-z0-9\s]{1,6})", texto_total, re.IGNORECASE)
+    m_area = re.search(r"(?:[AÁ]rea|Area)\s*[:\-\.]?\s*([A-Za-z0-9\s]{1,6})", texto_sin_titulo, re.IGNORECASE)
     if m_area:
         val_a = m_area.group(1).upper().strip()
         if "BE" in val_a: area_res = "BE"
         elif "SMT" in val_a: area_res = "SMT"
         elif "FA" in val_a: area_res = "FA"
     else:
-        if "BE" in texto_total.upper(): area_res = "BE"
-        elif "SMT" in texto_total.upper(): area_res = "SMT"
-        elif "FA" in texto_total.upper(): area_res = "FA"
+        if "BE" in texto_sin_titulo.upper(): area_res = "BE"
+        elif "SMT" in texto_sin_titulo.upper(): area_res = "SMT"
+        elif "FA" in texto_sin_titulo.upper(): area_res = "FA"
 
-    # 2. LÍNEA REAL
+    # 2. LÍNEA REAL (Búsqueda estricta de nombres reales)
     linea_res = ""
-    m_linea = re.search(r"(?:L[ií1l]nea|Linea|Line)\s*[:\-\.]?\s*([A-Za-z0-9\.\-\_\s]{2,25})", texto_total, re.IGNORECASE)
-    if m_linea:
-        cand = m_linea.group(1).strip()
-        cand = re.sub(r"(?:PROGRAMA|DE|5S|5'S|EN|L[IÍ]NEAS|DE|PRODUCCI[OÓ]N|Fecha|Semana|Ref).*", "", cand, flags=re.IGNORECASE).strip()
-        if len(cand) >= 2 and cand.upper() not in ["DE", "EN", "PROGRAMA"]:
-            linea_res = cand
+    
+    # Primero: verificar si coincide con catálogo de líneas reales de planta
+    nombres_lineas_planta = [
+        "WPC 2.5", "TRAILER", "ICT 5", "Flashing InLine", "Flashing Inline",
+        "CONFORMAL 1", "CONFORMAL 2", "CONFORMAL 3",
+        "SMT 1", "SMT 2", "SMT 3", "SMT 4", "SMT 5",
+        "ENSAMBLE 1", "ENSAMBLE 2", "ENSAMBLE 3", "TESTING 1", "TESTING 2"
+    ]
+    for lin in nombres_lineas_planta:
+        if lin.lower() in texto_sin_titulo.lower():
+            linea_res = lin
+            break
 
+    # Segundo: Si no está en el catálogo, extraer por patrón "Línea: [Texto]"
     if not linea_res:
-        nombres_lineas_planta = [
-            "WPC 2.5", "TRAILER", "ICT 5", "Flashing InLine", "Flashing Inline",
-            "CONFORMAL 1", "CONFORMAL 2", "CONFORMAL 3",
-            "SMT 1", "SMT 2", "SMT 3", "SMT 4", "SMT 5",
-            "ENSAMBLE 1", "ENSAMBLE 2", "ENSAMBLE 3", "TESTING 1", "TESTING 2"
-        ]
-        for lin in nombres_lineas_planta:
-            if lin.lower() in texto_total.lower():
-                linea_res = lin
-                break
+        m_linea = re.search(r"(?:L[ií1l]nea|Line)\s*:\s*([A-Za-z0-9\.\-\_\s]+?)(?=\s*(?:Semana|Fecha|Turno|Area|[AÁ]rea|Ref|\||\n|$))", texto_sin_titulo, re.IGNORECASE)
+        if m_linea:
+            cand = m_linea.group(1).strip()
+            cand = re.sub(r"^(?:de|en|del)\s+", "", cand, flags=re.IGNORECASE).strip()
+            if len(cand) >= 2 and cand.lower() not in ["de produccion", "de producción", "de", "en", "s area"]:
+                linea_res = cand
 
     if not linea_res:
         linea_res = "Línea Principal"
 
     # 3. SEMANA
     semana_res = 31
-    m_sem = re.search(r"(?:Semana|Week|Sem)\s*[:\-\.]?\s*([0-9]{1,2})", texto_total, re.IGNORECASE)
+    m_sem = re.search(r"(?:Semana|Week|Sem)\s*[:\-\.]?\s*([0-9]{1,2})", texto_sin_titulo, re.IGNORECASE)
     if m_sem:
         semana_res = int(m_sem.group(1))
 
-    # 4. FECHA BASE
+    # 4. FECHA BASE (LUNES)
     fecha_res = "7/27/2026"
-    m_fec = re.search(r"([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})", texto_total)
+    m_fec = re.search(r"([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})", texto_sin_titulo)
     if m_fec:
         fecha_res = m_fec.group(1).replace("-", "/").replace(".", "/")
 
@@ -240,7 +248,7 @@ def detectar_1_o_0(recorte: np.ndarray) -> Optional[int]:
 
 
 def procesar_hoja_evaluaciones(imagen_bgr: np.ndarray, metadatos: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Procesa la cuadrícula de días y turnos."""
+    """Procesa la cuadrícula de días y turnos (1, 2, 3)."""
     alto, ancho = imagen_bgr.shape[:2]
     filas = []
 
@@ -377,18 +385,23 @@ def generar_pdf_demo() -> bytes:
         ancho, alto = 1800, 2400
         lienzo = np.full((alto, ancho, 3), 255, dtype=np.uint8)
 
+        # Encabezado
         cv2.rectangle(lienzo, (50, 40), (ancho - 50, 240), (245, 245, 245), -1)
         cv2.rectangle(lienzo, (50, 40), (ancho - 50, 240), (40, 40, 40), 2)
         cv2.putText(lienzo, "PROGRAMA DE 5'S EN LINEAS DE PRODUCCION", (120, 90), cv2.FONT_HERSHEY_DUPLEX, 1.1, (20, 20, 20), 2)
         cv2.putText(lienzo, f"Area: {m['area']}   |   Linea: {m['linea']}", (80, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (30, 30, 30), 2)
-        cv2.putText(lienzo, f"Semana: {m['semana']}   |   Fecha Lunes: {m['dia']}", (80, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
+        cv2.putText(lienzo, f"Semana: {m['semana']}   |   Fecha: {m['dia']}", (80, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
 
+        # Tabla
         y_ini = 280
         cv2.rectangle(lienzo, (50, y_ini), (ancho - 50, y_ini + 50), (70, 70, 70), -1)
         cv2.putText(lienzo, "PUNTOS A VERIFICAR (1 = Cumple, 0 = No cumple)", (70, y_ini + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
         y_cur = y_ini + 50
         h_row = (alto - y_cur - 100) // len(PREGUNTAS_OFICIALES_5S)
+        
+        # Columna Turno 1 (idx_col = 0)
+        x_col_t1 = int(ancho * 0.38) + 20
 
         for p_idx, preg in enumerate(PREGUNTAS_OFICIALES_5S):
             bg = (255, 255, 255) if p_idx % 2 == 0 else (248, 248, 248)
@@ -398,12 +411,11 @@ def generar_pdf_demo() -> bytes:
             txt = f"{preg['num']}. [{preg['5S']}] {preg['pregunta'][:50]}"
             cv2.putText(lienzo, txt, (70, y_cur + int(h_row * 0.65)), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (30, 30, 30), 2)
 
-            x_eval = int(ancho * 0.75)
             val = 0 if preg["num"] in m["ceros"] else 1
             if val == 0:
-                cv2.circle(lienzo, (x_eval + 30, y_cur + int(h_row * 0.5)), 12, (180, 20, 20), 3)
+                cv2.circle(lienzo, (x_col_t1, y_cur + int(h_row * 0.5)), 12, (180, 20, 20), 3)
             else:
-                cv2.line(lienzo, (x_eval + 30, y_cur + 8), (x_eval + 30, y_cur + h_row - 8), (20, 120, 20), 4)
+                cv2.line(lienzo, (x_col_t1, y_cur + 8), (x_col_t1, y_cur + h_row - 8), (20, 120, 20), 4)
 
             y_cur += h_row
 
