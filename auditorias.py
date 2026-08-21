@@ -2,7 +2,8 @@
 auditorias.py
 =============
 Sistema OCR para Auditorías 5S en Líneas de Producción
-Extrae Área (FA, BE, SMT), Línea Real, Semana (ej. 31), Turno (1, 2, 3) y Evaluación (1 y 0).
+Procesa exclusivamente los archivos PDF escaneados subidos por el usuario.
+Extrae Área (FA, BE, SMT), Línea Real, Semana, Turno (1, 2, 3) y Evaluación (1 y 0).
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ PREGUNTAS_OFICIALES_5S: List[Dict[str, Any]] = [
 # ==========================================
 
 def extraer_paginas_pdf(archivo_bytes: bytes, extension: str) -> List[Tuple[np.ndarray, str]]:
-    """Extrae la imagen y el texto digital nativo (si existe) de cada página del PDF."""
+    """Extrae cada hoja del PDF como imagen para procesamiento visual OCR."""
     paginas_info: List[Tuple[np.ndarray, str]] = []
     if extension.lower() == ".pdf":
         try:
@@ -94,11 +95,11 @@ def extraer_paginas_pdf(archivo_bytes: bytes, extension: str) -> List[Tuple[np.n
 
 
 # ==========================================
-# 3. EXTRACCIÓN DE METADATOS (SIN CONFUSIÓN CON TÍTULOS)
+# 3. EXTRACCIÓN DE METADATOS DEL DOCUMENTO
 # ==========================================
 
 def corregir_orientacion(imagen_bgr: np.ndarray) -> np.ndarray:
-    """Corrige rotación de escaneo."""
+    """Corrige la inclinación si la hoja fue escaneada chueca."""
     try:
         alto, ancho = imagen_bgr.shape[:2]
         pequena = cv2.resize(imagen_bgr, (600, int(600 * alto / ancho)))
@@ -124,7 +125,7 @@ def corregir_orientacion(imagen_bgr: np.ndarray) -> np.ndarray:
 
 
 def ocr_texto_completo(imagen_bgr: np.ndarray) -> str:
-    """Ejecuta OCR sobre la cabecera de la imagen."""
+    """Lee el texto impreso en el encabezado de la hoja escaneada."""
     try:
         import pytesseract
         alto = imagen_bgr.shape[0]
@@ -140,10 +141,10 @@ def ocr_texto_completo(imagen_bgr: np.ndarray) -> str:
 
 
 def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[str, Any]:
-    """Extrae el Área, Línea real y Semana del documento, filtrando títulos."""
+    """Extrae el Área, Línea real y Semana del documento subido por el usuario."""
     texto_total = texto_nativo + "\n" + ocr_texto_completo(imagen_bgr)
     
-    # Limpiar del texto el título general "PROGRAMA DE 5'S EN LÍNEAS DE PRODUCCIÓN"
+    # Limpiar título para no confundir con el campo Línea
     texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5['\s]*S\s+EN\s+L[IÍ]NEAS\s+DE\s+PRODUCCI[OÓ]N", "", texto_total, flags=re.IGNORECASE)
     texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5S\s+EN\s+LINEAS\s+DE\s+PRODUCCION", "", texto_sin_titulo, flags=re.IGNORECASE)
     texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5['\s]*S", "", texto_sin_titulo, flags=re.IGNORECASE)
@@ -161,10 +162,8 @@ def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[
         elif "SMT" in texto_sin_titulo.upper(): area_res = "SMT"
         elif "FA" in texto_sin_titulo.upper(): area_res = "FA"
 
-    # 2. LÍNEA REAL (Búsqueda estricta de nombres reales)
+    # 2. LÍNEA REAL
     linea_res = ""
-    
-    # Primero: verificar si coincide con catálogo de líneas reales de planta
     nombres_lineas_planta = [
         "WPC 2.5", "TRAILER", "ICT 5", "Flashing InLine", "Flashing Inline",
         "CONFORMAL 1", "CONFORMAL 2", "CONFORMAL 3",
@@ -176,9 +175,8 @@ def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[
             linea_res = lin
             break
 
-    # Segundo: Si no está en el catálogo, extraer por patrón "Línea: [Texto]"
     if not linea_res:
-        m_linea = re.search(r"(?:L[ií1l]nea|Line)\s*:\s*([A-Za-z0-9\.\-\_\s]+?)(?=\s*(?:Semana|Fecha|Turno|Area|[AÁ]rea|Ref|\||\n|$))", texto_sin_titulo, re.IGNORECASE)
+        m_linea = re.search(r"(?:L[ií1l]nea|Line)\s*[:\-\.]?\s*([A-Za-z0-9\.\-\_\s]+?)(?=\s*(?:Semana|Fecha|Turno|Area|[AÁ]rea|Ref|\||\n|$))", texto_sin_titulo, re.IGNORECASE)
         if m_linea:
             cand = m_linea.group(1).strip()
             cand = re.sub(r"^(?:de|en|del)\s+", "", cand, flags=re.IGNORECASE).strip()
@@ -209,11 +207,11 @@ def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[
 
 
 # ==========================================
-# 4. MATRIZ DE PREGUNTAS (1 Y 0)
+# 4. MATRIZ DE EVALUACIÓN (DETECCIÓN DE 1 Y 0)
 # ==========================================
 
 def detectar_1_o_0(recorte: np.ndarray) -> Optional[int]:
-    """Detecta si la celda tiene un 1 o un 0."""
+    """Analiza visualmente la celda para detectar trazo de 1 o círculo de 0."""
     if recorte is None or recorte.size == 0:
         return None
     gris = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY) if len(recorte.shape) == 3 else recorte
@@ -248,7 +246,7 @@ def detectar_1_o_0(recorte: np.ndarray) -> Optional[int]:
 
 
 def procesar_hoja_evaluaciones(imagen_bgr: np.ndarray, metadatos: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Procesa la cuadrícula de días y turnos (1, 2, 3)."""
+    """Procesa la cuadrícula de días y turnos de la hoja subida."""
     alto, ancho = imagen_bgr.shape[:2]
     filas = []
 
@@ -324,7 +322,7 @@ def procesar_hoja_evaluaciones(imagen_bgr: np.ndarray, metadatos: Dict[str, Any]
 # ==========================================
 
 def generar_excel_descarga(df_consolidado: pd.DataFrame) -> bytes:
-    """Genera el Excel estilizado con encabezado negro idéntico a la plantilla."""
+    """Genera el Excel con encabezado negro idéntico a la plantilla solicitada."""
     output = io.BytesIO()
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -370,111 +368,38 @@ def generar_excel_descarga(df_consolidado: pd.DataFrame) -> bytes:
 
 
 # ==========================================
-# 6. DEMO MULTI-LÍNEA
-# ==========================================
-
-def generar_pdf_demo() -> bytes:
-    muestras = [
-        {"area": "FA", "linea": "WPC 2.5", "semana": 31, "dia": "7/27/2026", "ceros": [8]},
-        {"area": "FA", "linea": "TRAILER", "semana": 31, "dia": "7/27/2026", "ceros": [10, 11]},
-        {"area": "BE", "linea": "ICT 5", "semana": 31, "dia": "7/27/2026", "ceros": [8]},
-        {"area": "BE", "linea": "Flashing InLine", "semana": 31, "dia": "7/27/2026", "ceros": []}
-    ]
-    imagenes_pil = []
-    for m in muestras:
-        ancho, alto = 1800, 2400
-        lienzo = np.full((alto, ancho, 3), 255, dtype=np.uint8)
-
-        # Encabezado
-        cv2.rectangle(lienzo, (50, 40), (ancho - 50, 240), (245, 245, 245), -1)
-        cv2.rectangle(lienzo, (50, 40), (ancho - 50, 240), (40, 40, 40), 2)
-        cv2.putText(lienzo, "PROGRAMA DE 5'S EN LINEAS DE PRODUCCION", (120, 90), cv2.FONT_HERSHEY_DUPLEX, 1.1, (20, 20, 20), 2)
-        cv2.putText(lienzo, f"Area: {m['area']}   |   Linea: {m['linea']}", (80, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (30, 30, 30), 2)
-        cv2.putText(lienzo, f"Semana: {m['semana']}   |   Fecha: {m['dia']}", (80, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
-
-        # Tabla
-        y_ini = 280
-        cv2.rectangle(lienzo, (50, y_ini), (ancho - 50, y_ini + 50), (70, 70, 70), -1)
-        cv2.putText(lienzo, "PUNTOS A VERIFICAR (1 = Cumple, 0 = No cumple)", (70, y_ini + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-
-        y_cur = y_ini + 50
-        h_row = (alto - y_cur - 100) // len(PREGUNTAS_OFICIALES_5S)
-        
-        # Columna Turno 1 (idx_col = 0)
-        x_col_t1 = int(ancho * 0.38) + 20
-
-        for p_idx, preg in enumerate(PREGUNTAS_OFICIALES_5S):
-            bg = (255, 255, 255) if p_idx % 2 == 0 else (248, 248, 248)
-            cv2.rectangle(lienzo, (50, y_cur), (ancho - 50, y_cur + h_row), bg, -1)
-            cv2.rectangle(lienzo, (50, y_cur), (ancho - 50, y_cur + h_row), (190, 190, 190), 1)
-
-            txt = f"{preg['num']}. [{preg['5S']}] {preg['pregunta'][:50]}"
-            cv2.putText(lienzo, txt, (70, y_cur + int(h_row * 0.65)), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (30, 30, 30), 2)
-
-            val = 0 if preg["num"] in m["ceros"] else 1
-            if val == 0:
-                cv2.circle(lienzo, (x_col_t1, y_cur + int(h_row * 0.5)), 12, (180, 20, 20), 3)
-            else:
-                cv2.line(lienzo, (x_col_t1, y_cur + 8), (x_col_t1, y_cur + h_row - 8), (20, 120, 20), 4)
-
-            y_cur += h_row
-
-        imagenes_pil.append(Image.fromarray(cv2.cvtColor(lienzo, cv2.COLOR_BGR2RGB)))
-
-    out_pdf = io.BytesIO()
-    if imagenes_pil:
-        imagenes_pil[0].save(out_pdf, format="PDF", save_all=True, append_images=imagenes_pil[1:])
-    return out_pdf.getvalue()
-
-
-# ==========================================
-# 7. INTERFAZ WEB STREAMLIT
+# 6. INTERFAZ WEB STREAMLIT
 # ==========================================
 
 st.set_page_config(
     page_title="Extractor de Auditorías 5S",
     page_icon="📋",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 def main():
     st.title("📋 Extractor de Auditorías 5S")
     st.markdown("Digitalización y consolidación automática de auditorías en líneas de producción.")
 
-    with st.sidebar:
-        st.header("⚡ Opciones")
-        if st.button("✨ Cargar archivo de ejemplo", use_container_width=True):
-            st.session_state["pdf_bytes"] = generar_pdf_demo()
-            st.session_state["pdf_nombre"] = "auditorias_ejemplo.pdf"
-            st.success("Archivo de ejemplo cargado exitosamente.")
-
     archivo_subido = st.file_uploader(
         "📥 Arrastre archivos de auditorías para realizar la extracción de la información (.pdf)",
         type=["pdf", "png", "jpg", "jpeg"]
     )
 
-    datos_bytes = None
-    nombre_archivo = ""
-
-    if archivo_subido is not None:
-        datos_bytes = archivo_subido.getvalue()
-        nombre_archivo = archivo_subido.name
-    elif "pdf_bytes" in st.session_state:
-        datos_bytes = st.session_state["pdf_bytes"]
-        nombre_archivo = st.session_state["pdf_nombre"]
-        st.info(f"📌 Procesando archivo: `{nombre_archivo}`")
-
-    if datos_bytes is None:
-        st.warning("👈 Arrastre o seleccione un archivo PDF de auditorías para comenzar.")
+    if archivo_subido is None:
+        st.info("👈 Por favor cargue su archivo PDF de auditorías escaneadas para procesar.")
         return
+
+    datos_bytes = archivo_subido.getvalue()
+    nombre_archivo = archivo_subido.name
 
     with st.spinner("Extrayendo información de las auditorías..."):
         sufijo = Path(nombre_archivo).suffix.lower()
         paginas_info = extraer_paginas_pdf(datos_bytes, sufijo)
 
         if not paginas_info:
-            st.error("No se pudieron leer las páginas del archivo.")
+            st.error("No se pudieron leer las páginas del archivo subido.")
             return
 
         todas_las_filas = []
@@ -506,10 +431,11 @@ def main():
 
     st.markdown("---")
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📋 Matriz Consolidada",
         "🏭 Resumen por Línea",
-        "📥 Descargar Excel"
+        "📥 Descargar Excel",
+        "👁️ Ver Hojas Escaneadas"
     ])
 
     with tab1:
@@ -576,6 +502,14 @@ def main():
                 mime="text/csv",
                 use_container_width=True
             )
+
+    with tab4:
+        st.subheader("Comprobación Visual de Páginas Escaneadas")
+        st.info("Aquí puedes verificar visualmente las hojas escaneadas de tu archivo PDF.")
+        for idx, (img_bgr, _) in enumerate(paginas_info):
+            st.write(f"**Página {idx + 1} del documento:**")
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            st.image(img_rgb, use_container_width=True)
 
 
 if __name__ == "__main__":
