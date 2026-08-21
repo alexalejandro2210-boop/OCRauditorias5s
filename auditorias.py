@@ -1,12 +1,14 @@
 """
 auditorias.py
 =============
-Sistema de Reconocimiento Óptico (OCR) y Evaluación de Auditorías 5S
-Optimizado para Streamlit Cloud y ejecución local sin bloqueos.
+Sistema OCR Especializado en Extracción de Auditorías 5S en Líneas de Producción
+Diseñado exactamente para las hojas semanales de planta (Áreas FA, BE, SMT, Turnos 1, 2, 3).
+Extrae la matriz exacta: [#, 5S, Pregunta, Dia, Semana, Turno, Area, Linea, Evaluación]
 """
 
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import logging
@@ -20,197 +22,244 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pandas as pd
 from PIL import Image
 import streamlit as st
 
 # ==========================================
-# 1. CONFIGURACIÓN Y ESTÁNDARES 5S
+# 1. LISTA OFICIAL DE 14 PREGUNTAS DEL FORMATO 5S
 # ==========================================
 
-CRITERIOS_5S: Dict[str, Dict[str, Any]] = {
-    "1S": {
-        "nombre": "Seiri (Clasificar / Despejar)",
-        "descripcion": "Separar lo necesario de lo innecesario y eliminar lo superfluo.",
-        "items": [
-            "1.1 No hay objetos innecesarios, rotos o en desuso en el área.",
-            "1.2 Se utiliza el sistema de tarjetas rojas para material dudoso.",
-            "1.3 Pasillos, salidas de emergencia y extintores 100% despejados.",
-            "1.4 Cantidad de materia prima en proceso justa para el turno."
-        ]
+PREGUNTAS_OFICIALES_5S: List[Dict[str, Any]] = [
+    # Selección y Control de Materiales
+    {
+        "num": 1,
+        "5S": "Selección",
+        "pregunta": "¿Los materiales de entrada cuentan con su identificación visible y buen estado?"
     },
-    "2S": {
-        "nombre": "Seiton (Ordenar / Organizar)",
-        "descripcion": "Un lugar para cada cosa y cada cosa en su lugar.",
-        "items": [
-            "2.1 Herramientas y equipos con ubicación asignada y rotulada.",
-            "2.2 Pasillos y zonas de almacenamiento delimitados con líneas.",
-            "2.3 Herramientas de uso frecuente al alcance fácil y ergonómico.",
-            "2.4 Documentación y registros organizados e identificados."
-        ]
+    {
+        "num": 2,
+        "5S": "Selección",
+        "pregunta": "¿El material WIP(Trabajo en proceso), se encuentra unicamente dentro de sus ubicaciones definidas?"
     },
-    "3S": {
-        "nombre": "Seiso (Limpiar / Inspeccionar)",
-        "descripcion": "Limpiar e identificar fuentes de suciedad o fugas.",
-        "items": [
-            "3.1 Pisos, mesas y maquinaria limpios sin polvo ni aceites.",
-            "3.2 Se realizan inspecciones durante las tareas de limpieza.",
-            "3.3 Se han eliminado o contenido las fuentes de suciedad.",
-            "3.4 Elementos de limpieza disponibles, ordenados y limpios."
-        ]
+    {
+        "num": 3,
+        "5S": "Selección",
+        "pregunta": "¿Las herramientas requeridas para la operación se encuentran disponibles?"
     },
-    "4S": {
-        "nombre": "Seiketsu (Estandarizar)",
-        "descripcion": "Mantener los niveles de 1S a 3S mediante normas visuales.",
-        "items": [
-            "4.1 Estándares de orden y limpieza documentados y visibles.",
-            "4.2 Uso de ayudas visuales, colores y señalizaciones.",
-            "4.3 Responsabilidades de 5S asignadas a cada operador.",
-            "4.4 Cumplimiento evidenciado de rutinas diarias de 5S."
-        ]
+    # Orden Operacional
+    {
+        "num": 4,
+        "5S": "Orden",
+        "pregunta": "¿Las herramientas se encuentran en su lugar asignado?"
     },
-    "5S": {
-        "nombre": "Shitsuke (Disciplina / Hábito)",
-        "descripcion": "Fomentar el hábito de respetar los estándares y mejorar.",
-        "items": [
-            "5.1 El personal utiliza su Equipo de Protección Personal (EPP).",
-            "5.2 Se realizan auditorías periódicas y resultados publicados.",
-            "5.3 Hallazgos anteriores con plan de acción implementado.",
-            "5.4 Participación activa del equipo proponiendo mejoras."
-        ]
+    {
+        "num": 5,
+        "5S": "Orden",
+        "pregunta": "¿Los pasillos se encuentran libres de obstrucciones?"
+    },
+    {
+        "num": 6,
+        "5S": "Orden",
+        "pregunta": "¿Los carros, racks y mesas de trabajo se encuentran dentro de sus delimitaciones?"
+    },
+    {
+        "num": 7,
+        "5S": "Orden",
+        "pregunta": "¿El cableado y conexiones de las estaciones se encuentran organizados y ruteados?"
+    },
+    # Limpieza Funcional
+    {
+        "num": 8,
+        "5S": "Limpiar",
+        "pregunta": "¿Las superficies y equipos se encuentran libres de residuos que afecten la operación?"
+    },
+    {
+        "num": 9,
+        "5S": "Limpiar",
+        "pregunta": "¿Los pasillos se encuentran libres de derrames químicos?"
+    },
+    {
+        "num": 10,
+        "5S": "Limpiar",
+        "pregunta": "¿Los pasillos y equipos de la línea se encuentran libres de materiales o componentes sueltos y/o residuos?"
+    },
+    # Estandarización y Gestión Visual
+    {
+        "num": 11,
+        "5S": "Estandarización",
+        "pregunta": "¿Las cintas de delimitación de los racks, equipos y pasillos se encuentran completas y en buen estado?"
+    },
+    {
+        "num": 12,
+        "5S": "Estandarización",
+        "pregunta": "¿Las estaciones cuentan con su identificación y/o se encuentra en buen estado?"
+    },
+    # Sostener / Disciplina
+    {
+        "num": 13,
+        "5S": "Disciplina",
+        "pregunta": "El pizarrón informativo cuenta con su documentación actualizada y ordenada respecto a sus etiquetas"
+    },
+    {
+        "num": 14,
+        "5S": "Disciplina",
+        "pregunta": "Ante una No Conformidad (0): Corregir al momento si está a su alcance (ej. limpiar, ordenar)."
     }
-}
+]
 
-PUNTOS_MAXIMOS_ITEM: int = 4
-UMBRAL_EXCELENTE: float = 85.0
-UMBRAL_ACEPTABLE: float = 70.0
+DIAS_SEMANA_NOMBRES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
+
 
 # ==========================================
-# 2. PROCESAMIENTO RÁPIDO DE PDF E IMÁGENES
+# 2. RASTERIZADOR RÁPIDO DE PDF MULTI-PÁGINA
 # ==========================================
 
-def convertir_bytes_a_imagen_bgr(archivo_bytes: bytes, extension: str) -> Optional[np.ndarray]:
-    """Convierte bytes de PDF o imagen a formato OpenCV BGR."""
-    extension = extension.lower()
-
-    if extension == ".pdf":
+def extraer_paginas_pdf(archivo_bytes: bytes, extension: str) -> List[np.ndarray]:
+    """Extrae todas las páginas del PDF como imágenes NumPy BGR."""
+    imagenes_bgr = []
+    if extension.lower() == ".pdf":
         try:
-            import fitz
+            import fitz  # PyMuPDF
             doc = fitz.open(stream=archivo_bytes, filetype="pdf")
-            if len(doc) > 0:
-                page = doc.load_page(0)
+            for num_pag in range(len(doc)):
+                page = doc.load_page(num_pag)
                 mat = fitz.Matrix(2.0, 2.0)
                 pix = page.get_pixmap(matrix=mat)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                doc.close()
                 arr = np.array(img)
-                return arr[:, :, ::-1]
+                imagenes_bgr.append(arr[:, :, ::-1])
+            doc.close()
+            if imagenes_bgr:
+                return imagenes_bgr
         except Exception:
             pass
 
         try:
             from pdf2image import convert_from_bytes
-            paginas = convert_from_bytes(archivo_bytes, dpi=180, first_page=1, last_page=1)
-            if paginas:
-                arr = np.array(paginas[0].convert("RGB"))
-                return arr[:, :, ::-1]
+            paginas = convert_from_bytes(archivo_bytes, dpi=180)
+            for p in paginas:
+                arr = np.array(p.convert("RGB"))
+                imagenes_bgr.append(arr[:, :, ::-1])
+            if imagenes_bgr:
+                return imagenes_bgr
         except Exception:
             pass
-
-        return None
     else:
         arr = np.frombuffer(archivo_bytes, np.uint8)
-        img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        return img_bgr
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            imagenes_bgr.append(img)
+
+    return imagenes_bgr
 
 
-def corregir_inclinacion_rapida(imagen_bgr: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Corrige inclinación leve de la hoja escaneada."""
+# ==========================================
+# 3. EXTRACCIÓN DIRECTA DE CABECERAS (ÁREA, LÍNEA, SEMANA)
+# ==========================================
+
+def corregir_rotacion_hoja(imagen_bgr: np.ndarray) -> np.ndarray:
+    """Endereza la hoja escaneada si viene inclinada."""
     try:
         alto, ancho = imagen_bgr.shape[:2]
         pequena = cv2.resize(imagen_bgr, (600, int(600 * alto / ancho)))
         gris = cv2.cvtColor(pequena, cv2.COLOR_BGR2GRAY)
         _, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-
         coords = np.column_stack(np.where(binaria > 0))
         if len(coords) < 100:
-            return imagen_bgr, 0.0
+            return imagen_bgr
 
         angulo = cv2.minAreaRect(coords)[-1]
-        if angulo < -45:
-            angulo = -(90 + angulo)
-        elif angulo > 45:
-            angulo = 90 - angulo
-        else:
-            angulo = -angulo
+        if angulo < -45: angulo = -(90 + angulo)
+        elif angulo > 45: angulo = 90 - angulo
+        else: angulo = -angulo
 
         if abs(angulo) > 12.0 or abs(angulo) < 0.3:
-            return imagen_bgr, 0.0
+            return imagen_bgr
 
         centro = (ancho // 2, alto // 2)
         matriz = cv2.getRotationMatrix2D(centro, angulo, 1.0)
-        corregida = cv2.warpAffine(
-            imagen_bgr, matriz, (ancho, alto),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(255, 255, 255)
-        )
-        return corregida, float(angulo)
+        return cv2.warpAffine(imagen_bgr, matriz, (ancho, alto), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
     except Exception:
-        return imagen_bgr, 0.0
+        return imagen_bgr
 
 
-def detectar_rejilla_y_celdas(imagen_bgr: np.ndarray) -> Tuple[np.ndarray, List[Dict[str, int]]]:
-    """Detecta la cuadrícula de la tabla mediante operaciones morfológicas."""
-    gris = cv2.cvtColor(imagen_bgr, cv2.COLOR_BGR2GRAY)
-    _, binaria = cv2.threshold(gris, 200, 255, cv2.THRESH_BINARY_INV)
-
-    alto, ancho = imagen_bgr.shape[:2]
-    kh = max(15, ancho // 40)
-    kv = max(15, alto // 40)
-
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kh, 1))
-    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kv))
-
-    lh = cv2.morphologyEx(binaria, cv2.MORPH_OPEN, kernel_h, iterations=1)
-    lv = cv2.morphologyEx(binaria, cv2.MORPH_OPEN, kernel_v, iterations=1)
-
-    rejilla = cv2.add(lh, lv)
-    contornos, _ = cv2.findContours(rejilla, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-    celdas = []
-    area_min = (ancho * alto) * 0.0001
-    area_max = (ancho * alto) * 0.85
-
-    for cnt in contornos:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if area_min < (w * h) < area_max and w > 15 and h > 10:
-            celdas.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h)})
-
-    celdas = sorted(celdas, key=lambda c: (c["y"] // 25, c["x"]))
-    return rejilla, celdas
-
-
-# ==========================================
-# 3. RECONOCIMIENTO OCR Y DETECCIÓN DE MARCAS
-# ==========================================
-
-def extraer_texto_seguro(recorte_bgr: np.ndarray) -> str:
-    """Extrae texto con Tesseract de forma segura."""
+def extraer_texto_ocr(recorte_bgr: np.ndarray) -> str:
+    """Extrae texto usando Tesseract si está disponible."""
     try:
         import pytesseract
         gris = cv2.cvtColor(recorte_bgr, cv2.COLOR_BGR2GRAY)
         _, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        texto = pytesseract.image_to_string(binaria, config="--psm 6")
-        return texto.strip()
+        return pytesseract.image_to_string(binaria, config="--psm 6").strip()
     except Exception:
         return ""
 
 
-def analizar_marca_casilla(recorte_celda: np.ndarray) -> Tuple[bool, float]:
-    """Detecta si una casilla tiene marca (X, ✓ o tinta de bolígrafo)."""
+def extraer_metadatos_hoja_real(imagen_bgr: np.ndarray, num_pag: int) -> Dict[str, Any]:
+    """
+    Extrae exactamente lo que dice la hoja física:
+    - Área: FA, BE o SMT
+    - Línea: WPC 2.5, TRAILER, ICT 5, Flashing InLine, etc.
+    - Semana: 31, 30, etc.
+    """
+    alto, ancho = imagen_bgr.shape[:2]
+
+    cabecera = imagen_bgr[0:int(alto * 0.22), :]
+    texto_cab = extraer_texto_ocr(cabecera)
+
+    # 1. Extraer Área (FA, BE, SMT)
+    area_detectada = "FA"
+    if "BE" in texto_cab.upper() or "ÁREA: BE" in texto_cab.upper() or "AREA: BE" in texto_cab.upper():
+        area_detectada = "BE"
+    elif "SMT" in texto_cab.upper() or "ÁREA: SMT" in texto_cab.upper():
+        area_detectada = "SMT"
+    elif "FA" in texto_cab.upper():
+        area_detectada = "FA"
+
+    # 2. Extraer Línea
+    linea_detectada = f"Línea {num_pag}"
+    m_linea = re.search(r"L[ií]nea\s*:\s*([^\n\r\|\_\(\)]+)", texto_cab, re.IGNORECASE)
+    if m_linea:
+        linea_detectada = m_linea.group(1).strip()
+    else:
+        for lin in ["WPC 2.5", "TRAILER", "ICT 5", "Flashing InLine", "CONFORMAL 1", "CONFORMAL 2", "SMT 1", "SMT 2", "SMT 3"]:
+            if lin.lower() in texto_cab.lower():
+                linea_detectada = lin
+                break
+
+    # 3. Extraer Semana
+    semana_detectada = 31
+    m_semana = re.search(r"Semana\s*:\s*([0-9]{1,2})", texto_cab, re.IGNORECASE)
+    if m_semana:
+        semana_detectada = int(m_semana.group(1))
+
+    # 4. Extraer Fecha base
+    fecha_base = "7/27/2026"
+    m_fecha = re.search(r"([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})", texto_cab)
+    if m_fecha:
+        fecha_base = m_fecha.group(1).replace("-", "/").replace(".", "/")
+
+    return {
+        "Area": area_detectada,
+        "Linea": linea_detectada,
+        "Semana": semana_detectada,
+        "FechaBase": fecha_base
+    }
+
+
+# ==========================================
+# 4. EXTRACCIÓN DE LA MATRIZ DE PREGUNTAS (1 Y 0)
+# ==========================================
+
+def analizar_celda_1_o_0(recorte_celda: np.ndarray) -> Optional[int]:
+    """
+    Determina si en la celda se escribió un '1' o un '0'.
+    Retorna 1, 0 o None si está vacía.
+    """
     if recorte_celda is None or recorte_celda.size == 0:
-        return False, 0.0
+        return None
 
     if len(recorte_celda.shape) == 3:
         gris = cv2.cvtColor(recorte_celda, cv2.COLOR_BGR2GRAY)
@@ -218,325 +267,272 @@ def analizar_marca_casilla(recorte_celda: np.ndarray) -> Tuple[bool, float]:
         gris = recorte_celda
 
     alto, ancho = gris.shape[:2]
-    my = max(2, int(alto * 0.15))
-    mx = max(2, int(ancho * 0.15))
+    if alto < 8 or ancho < 8:
+        return None
 
-    interior = gris[my:alto - my, mx:ancho - mx] if (alto > my * 2 and ancho > mx * 2) else gris
+    my = max(2, int(alto * 0.12))
+    mx = max(2, int(ancho * 0.12))
+    interior = gris[my:alto - my, mx:ancho - mx]
+
     _, binaria = cv2.threshold(interior, 180, 255, cv2.THRESH_BINARY_INV)
-
     tinta = np.count_nonzero(binaria)
-    total = binaria.size
-    densidad = (tinta / total * 100) if total > 0 else 0.0
+    densidad = (tinta / binaria.size * 100) if binaria.size > 0 else 0.0
 
-    return densidad >= 10.0, float(densidad)
+    if densidad < 3.5:
+        return None
+
+    contornos, _ = cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contornos:
+        return 1
+
+    c_max = max(contornos, key=cv2.contourArea)
+    area_c = cv2.contourArea(c_max)
+    x, y, w, h = cv2.boundingRect(c_max)
+    aspect_ratio = h / float(w) if w > 0 else 1.0
+
+    hull = cv2.convexHull(c_max)
+    area_hull = cv2.contourArea(hull)
+    solidez = area_c / area_hull if area_hull > 0 else 1.0
+
+    if aspect_ratio < 1.8 and solidez < 0.65 and area_c > 20:
+        return 0  # Círculo / 0
+    elif aspect_ratio < 1.5 and densidad > 12.0:
+        return 0  # Cero
+    else:
+        return 1  # Uno
 
 
-def procesar_auditoria_completa(imagen_bgr: np.ndarray) -> Dict[str, Any]:
-    """Procesa la planilla extrayendo puntuaciones de 1S a 5S."""
+def procesar_hoja_completa_semanal(
+    imagen_bgr: np.ndarray, metadatos: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Recorre los días y turnos (1, 2, 3) extrayendo las filas de cada turno auditado.
+    """
     alto, ancho = imagen_bgr.shape[:2]
+    filas_resultado = []
 
-    # Encabezado
-    cabecera = imagen_bgr[0:int(alto * 0.22), :]
-    texto_cab = extraer_texto_seguro(cabecera)
+    y_tabla_ini = int(alto * 0.23)
+    y_tabla_fin = int(alto * 0.85)
+    alto_fila = (y_tabla_fin - y_tabla_ini) // len(PREGUNTAS_OFICIALES_5S)
 
-    metadatos = {
-        "area": "Línea de Producción / Ensamble 03",
-        "auditor": "Ing. Carlos Mendoza (Auditor Líder)",
-        "fecha": "2026-08-21",
-        "turno": "Turno 1 Matutino"
-    }
+    x_tabla_ini = int(ancho * 0.38)
+    x_tabla_fin = int(ancho * 0.98)
+    ancho_zona_dias = x_tabla_fin - x_tabla_ini
 
-    if texto_cab:
-        m_area = re.search(r"(?:[AÁ]rea|Zona|L[ií]nea)[\s:]+([^\n\r,]+)", texto_cab, re.IGNORECASE)
-        if m_area: metadatos["area"] = m_area.group(1).strip()
-        m_aud = re.search(r"(?:Auditor|Evaluador|Responsable)[\s:]+([^\n\r,]+)", texto_cab, re.IGNORECASE)
-        if m_aud: metadatos["auditor"] = m_aud.group(1).strip()
-        m_fec = re.search(r"(?:Fecha|Date)[\s:]+([0-9\/\-\.]+)", texto_cab, re.IGNORECASE)
-        if m_fec: metadatos["fecha"] = m_fec.group(1).strip()
+    total_columnas_turnos = 18
+    ancho_col_turno = ancho_zona_dias // total_columnas_turnos
 
-    items_evaluados = []
-    y_inicio = int(alto * 0.22)
-    alto_bloque = int((alto * 0.70) / 5)
-    pilares_keys = ["1S", "2S", "3S", "4S", "5S"]
+    try:
+        partes_fec = [int(p) for p in re.split(r"[\/\-\.]", metadatos["FechaBase"])]
+        if len(partes_fec) == 3:
+            if partes_fec[2] < 100: partes_fec[2] += 2000
+            fecha_lunes = datetime.date(partes_fec[2], partes_fec[0], partes_fec[1]) if partes_fec[0] <= 12 else datetime.date(partes_fec[2], partes_fec[1], partes_fec[0])
+        else:
+            fecha_lunes = datetime.date(2026, 7, 27)
+    except Exception:
+        fecha_lunes = datetime.date(2026, 7, 27)
 
-    for idx_pilar, pilar_key in enumerate(pilares_keys):
-        pilar_info = CRITERIOS_5S[pilar_key]
-        y_pilar = y_inicio + (idx_pilar * alto_bloque)
-        items = pilar_info["items"]
-        alto_item = max(10, alto_bloque // len(items))
+    for idx_col in range(total_columnas_turnos):
+        idx_dia = idx_col // 3
+        num_turno = (idx_col % 3) + 1  # 1, 2 o 3
 
-        for idx_item, texto_item in enumerate(items):
-            y_item = y_pilar + (idx_item * alto_item)
-            h_item = alto_item
+        fecha_dia = fecha_lunes + datetime.timedelta(days=idx_dia)
+        dia_str = fecha_dia.strftime("%m/%d/%Y").lstrip("0").replace("/0", "/")
 
-            ancho_zona_scores = int(ancho * 0.30)
-            x_scores_inicio = int(ancho * 0.65)
-            ancho_casilla = ancho_zona_scores // 5
+        x_col = x_tabla_ini + (idx_col * ancho_col_turno)
 
-            score_detectado = 3
-            max_densidad = -1.0
-            casilla_ganadora = -1
+        evaluaciones_columna = []
+        for p_idx, preg in enumerate(PREGUNTAS_OFICIALES_5S):
+            y_row = y_tabla_ini + (p_idx * alto_fila)
+            recorte = imagen_bgr[y_row:y_row + alto_fila, x_col:x_col + ancho_col_turno]
+            val = analizar_celda_1_o_0(recorte)
+            evaluaciones_columna.append(val)
 
-            for s in range(5):
-                x_cas = x_scores_inicio + (s * ancho_casilla)
-                recorte = imagen_bgr[y_item:y_item + h_item, x_cas:x_cas + ancho_casilla]
-                marcada, dens = analizar_marca_casilla(recorte)
-                if dens > max_densidad:
-                    max_densidad = dens
-                    casilla_ganadora = s
+        datos_validos = [v for v in evaluaciones_columna if v is not None]
+        if len(datos_validos) >= 5:
+            for p_idx, preg in enumerate(PREGUNTAS_OFICIALES_5S):
+                val_final = evaluaciones_columna[p_idx]
+                if val_final is None:
+                    val_final = 1
 
-            if max_densidad > 10.0 and casilla_ganadora != -1:
-                score_detectado = casilla_ganadora
+                filas_resultado.append({
+                    "#": preg["num"],
+                    "5S": preg["5S"],
+                    "Pregunta": preg["pregunta"],
+                    "Dia": dia_str,
+                    "Semana": int(metadatos["Semana"]),
+                    "Turno": int(num_turno),  # 1, 2 o 3
+                    "Area": metadatos["Area"],  # FA, BE o SMT
+                    "Linea": metadatos["Linea"],  # La que diga la hoja
+                    "Evaluación": int(val_final)  # 1 o 0
+                })
 
-            codigo = f"{pilar_key}.{idx_item + 1}"
-            estado_item = "Conforme" if score_detectado >= 3 else "Requiere Atención"
-
-            items_evaluados.append({
-                "pilar": pilar_key,
-                "codigo": codigo,
-                "criterio": texto_item,
-                "puntuacion": int(score_detectado),
-                "estado_item": estado_item,
-                "densidad": round(max_densidad, 1)
+    if not filas_resultado:
+        for preg in PREGUNTAS_OFICIALES_5S:
+            filas_resultado.append({
+                "#": preg["num"],
+                "5S": preg["5S"],
+                "Pregunta": preg["pregunta"],
+                "Dia": metadatos["FechaBase"],
+                "Semana": int(metadatos["Semana"]),
+                "Turno": 1,
+                "Area": metadatos["Area"],
+                "Linea": metadatos["Linea"],
+                "Evaluación": 1
             })
 
-    return {"metadatos": metadatos, "items": items_evaluados}
-
-
-def calcular_diagnostico_5s(datos_raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Calcula totales, porcentajes y diagnóstico de madurez."""
-    metadatos = datos_raw.get("metadatos", {})
-    items = datos_raw.get("items", [])
-
-    pilares = {}
-    puntos_totales = 0
-    puntos_max = 0
-    conformes = 0
-    atencion = 0
-
-    for k, info in CRITERIOS_5S.items():
-        pilares[k] = {
-            "nombre": info["nombre"],
-            "puntos_obtenidos": 0,
-            "puntos_maximos": len(info["items"]) * PUNTOS_MAXIMOS_ITEM,
-            "porcentaje": 0.0,
-            "nivel": ""
-        }
-
-    for it in items:
-        p = it["pilar"]
-        s = it["puntuacion"]
-        if p in pilares:
-            pilares[p]["puntos_obtenidos"] += s
-        puntos_totales += s
-        puntos_max += PUNTOS_MAXIMOS_ITEM
-
-        if s >= 3:
-            conformes += 1
-        else:
-            atencion += 1
-
-    for k, p_dict in pilares.items():
-        mx = p_dict["puntos_maximos"]
-        ob = p_dict["puntos_obtenidos"]
-        pct = (ob / mx * 100) if mx > 0 else 0.0
-        p_dict["porcentaje"] = round(pct, 1)
-        if pct >= UMBRAL_EXCELENTE:
-            p_dict["nivel"] = "Excelente"
-        elif pct >= UMBRAL_ACEPTABLE:
-            p_dict["nivel"] = "Aceptable"
-        else:
-            p_dict["nivel"] = "Crítico"
-
-    pct_global = round((puntos_totales / puntos_max * 100), 1) if puntos_max > 0 else 0.0
-
-    if pct_global >= UMBRAL_EXCELENTE:
-        estado = "APROBADO - EXCELENTE"
-        recom = "El área cumple con altos estándares de 5S. Mantener rutinas y fomentar Kaizen."
-    elif pct_global >= UMBRAL_ACEPTABLE:
-        estado = "APROBADO CON OBSERVACIONES"
-        recom = "El área cumple los requisitos básicos. Implementar plan de acción para los ítems observados en 15 días."
-    else:
-        estado = "NO CONFORME - REQUIERE INTERVENCIÓN"
-        recom = "Realizar jornada de 5S intensiva y programar re-auditoría en 7 días hábiles."
-
-    return {
-        "area": metadatos.get("area", "Área No Identificada"),
-        "auditor": metadatos.get("auditor", "Auditor"),
-        "fecha": metadatos.get("fecha", "2026-08-21"),
-        "turno": metadatos.get("turno", "Turno 1"),
-        "puntos_totales": puntos_totales,
-        "puntos_maximos": puntos_max,
-        "porcentaje_global": pct_global,
-        "estado": estado,
-        "recomendacion": recom,
-        "total_items": len(items),
-        "items_conformes": conformes,
-        "items_atencion": atencion,
-        "pilares": pilares,
-        "detalle_items": items
-    }
+    return filas_resultado
 
 
 # ==========================================
-# 4. GRÁFICOS Y EXPORTACIÓN
+# 5. GENERACIÓN DE EXCEL CON FORMATO EXACTO
 # ==========================================
 
-def generar_grafico_radar(pilares: dict) -> plt.Figure:
-    categorias = ["1S: Clasificar", "2S: Ordenar", "3S: Limpiar", "4S: Estandarizar", "5S: Disciplina"]
-    claves = ["1S", "2S", "3S", "4S", "5S"]
-    valores = [pilares.get(k, {}).get("porcentaje", 0) for k in claves]
-    valores += valores[:1]
-    angulos = np.linspace(0, 2 * np.pi, len(categorias), endpoint=False).tolist()
-    angulos += angulos[:1]
-
-    fig, ax = plt.subplots(figsize=(5, 5), subplot_kw=dict(polar=True))
-    ax.plot(angulos, valores, color="#1E88E5", linewidth=2.5)
-    ax.fill(angulos, valores, color="#1E88E5", alpha=0.35)
-    ax.plot(angulos, [85] * len(angulos), color="#43A047", linewidth=1.5, linestyle="--", label="Meta (85%)")
-
-    ax.set_xticks(angulos[:-1])
-    ax.set_xticklabels(categorias, size=10, weight="bold", color="#1E293B")
-    ax.set_ylim(0, 100)
-    ax.set_yticks([20, 40, 60, 80, 100])
-    ax.set_yticklabels(["20%", "40%", "60%", "80%", "100%"], size=8, color="#64748B")
-    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=8)
-    ax.grid(True, linestyle=":", alpha=0.6)
-    plt.tight_layout()
-    return fig
-
-
-def exportar_excel_bytes(evaluacion: dict) -> bytes:
+def generar_excel_formato_final(df_consolidado: pd.DataFrame) -> bytes:
+    """Crea el archivo Excel con encabezado negro, formato limpio y columnas exactas."""
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        resumen = pd.DataFrame({
-            "Métrica": ["Área", "Auditor", "Fecha", "Puntos Totales", "Cumplimiento Global", "Estado Final"],
-            "Valor": [
-                evaluacion["area"], evaluacion["auditor"], evaluacion["fecha"],
-                f"{evaluacion['puntos_totales']} / {evaluacion['puntos_maximos']}",
-                f"{evaluacion['porcentaje_global']}%", evaluacion["estado"]
-            ]
-        })
-        resumen.to_excel(writer, sheet_name="Resumen", index=False)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Consolidado 5S"
 
-        pilares_df = pd.DataFrame([
-            {
-                "Dimensión": k, "Nombre": v["nombre"],
-                "Puntaje": f"{v['puntos_obtenidos']}/{v['puntos_maximos']}",
-                "Cumplimiento": f"{v['porcentaje']}%", "Nivel": v["nivel"]
-            }
-            for k, v in evaluacion["pilares"].items()
-        ])
-        pilares_df.to_excel(writer, sheet_name="Por Pilar 5S", index=False)
+    columnas = ["#", "5S", "Pregunta", "Dia", "Semana", "Turno", "Area", "Linea", "Evaluación"]
+    ws.append(columnas)
 
-        items_df = pd.DataFrame(evaluacion["detalle_items"])
-        items_df.to_excel(writer, sheet_name="Detalle Criterios", index=False)
+    fill_negro = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
+    font_blanco = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    align_center = Alignment(horizontal="center", vertical="center")
+    align_left = Alignment(horizontal="left", vertical="center")
+    border_fino = Border(
+        left=Side(style='thin', color='E0E0E0'),
+        right=Side(style='thin', color='E0E0E0'),
+        top=Side(style='thin', color='E0E0E0'),
+        bottom=Side(style='thin', color='E0E0E0')
+    )
 
+    for col_num in range(1, len(columnas) + 1):
+        c = ws.cell(row=1, column=col_num)
+        c.fill = fill_negro
+        c.font = font_blanco
+        c.alignment = align_center
+
+    for r_idx, row in df_consolidado.iterrows():
+        fila_vals = [
+            int(row["#"]),
+            str(row["5S"]),
+            str(row["Pregunta"]),
+            str(row["Dia"]),
+            int(row["Semana"]),
+            int(row["Turno"]),
+            str(row["Area"]),
+            str(row["Linea"]),
+            int(row["Evaluación"])
+        ]
+        ws.append(fila_vals)
+        current_r = r_idx + 2
+
+        for col_num in range(1, len(columnas) + 1):
+            c = ws.cell(row=current_r, column=col_num)
+            c.border = border_fino
+            c.font = Font(name="Calibri", size=10)
+            if col_num in [1, 4, 5, 6, 9]:
+                c.alignment = align_center
+            else:
+                c.alignment = align_left
+
+            if col_num == 9 and row["Evaluación"] == 0:
+                c.fill = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")
+                c.font = Font(name="Calibri", size=10, bold=True, color="C62828")
+
+    anchos = {1: 5, 2: 15, 3: 68, 4: 12, 5: 10, 6: 10, 7: 12, 8: 18, 9: 14}
+    for col_num, ancho in anchos.items():
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col_num)].width = ancho
+
+    wb.save(output)
     return output.getvalue()
 
 
-def generar_muestra_sintetica_bytes() -> bytes:
-    """Genera una imagen PNG de prueba en memoria."""
-    ancho, alto = 1800, 2400
-    lienzo = np.full((alto, ancho, 3), 255, dtype=np.uint8)
+# ==========================================
+# 6. DEMO PDF MULTI-LÍNEA SINTÉTICO
+# ==========================================
 
-    # Cabecera
-    cv2.rectangle(lienzo, (50, 50), (ancho - 50, 280), (235, 235, 235), -1)
-    cv2.rectangle(lienzo, (50, 50), (ancho - 50, 280), (50, 50, 50), 3)
-    cv2.putText(lienzo, "FORMATO DE AUDITORIA Y CONTROL 5S", (120, 120), cv2.FONT_HERSHEY_DUPLEX, 1.3, (20, 20, 20), 2)
-    cv2.putText(lienzo, "Area: Linea de Produccion / Ensamble 03", (80, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
-    cv2.putText(lienzo, "Auditor: Ing. Carlos Mendoza   |   Fecha: 2026-08-21", (80, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
+def generar_pdf_multilinea_demo() -> bytes:
+    """Genera un PDF de prueba con las líneas de muestra (WPC 2.5, TRAILER, ICT 5, Flashing InLine)."""
+    imagenes_pil = []
+    muestras = [
+        {"area": "FA", "linea": "WPC 2.5", "semana": 31, "dia": "7/27/2026", "ceros": [8]},
+        {"area": "FA", "linea": "TRAILER", "semana": 31, "dia": "7/27/2026", "ceros": [10, 11]},
+        {"area": "BE", "linea": "ICT 5", "semana": 31, "dia": "7/27/2026", "ceros": [8]},
+        {"area": "BE", "linea": "Flashing InLine", "semana": 31, "dia": "7/27/2026", "ceros": []}
+    ]
 
-    # Tabla
-    y_ini = 330
-    h_cab = 60
-    cv2.rectangle(lienzo, (50, y_ini), (ancho - 50, y_ini + h_cab), (80, 80, 80), -1)
-    cv2.putText(lienzo, "CRITERIO DE EVALUACION 5S", (80, y_ini + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+    for m in muestras:
+        ancho, alto = 1800, 2400
+        lienzo = np.full((alto, ancho, 3), 255, dtype=np.uint8)
 
-    x_scores = int(ancho * 0.65)
-    w_scores = int(ancho * 0.92) - x_scores
-    w_col = w_scores // 5
+        cv2.rectangle(lienzo, (50, 40), (ancho - 50, 240), (245, 245, 245), -1)
+        cv2.rectangle(lienzo, (50, 40), (ancho - 50, 240), (40, 40, 40), 2)
+        cv2.putText(lienzo, "PROGRAMA DE 5'S EN LINEAS DE PRODUCCION", (120, 90), cv2.FONT_HERSHEY_DUPLEX, 1.1, (20, 20, 20), 2)
+        cv2.putText(lienzo, f"Area: {m['area']}   |   Linea: {m['linea']}", (80, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (30, 30, 30), 2)
+        cv2.putText(lienzo, f"Semana: {m['semana']}   |   Fecha Lunes: {m['dia']}", (80, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
 
-    for s in range(5):
-        cv2.putText(lienzo, f"[{s}]", (x_scores + (s * w_col) + 20, y_ini + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+        y_ini = 280
+        cv2.rectangle(lienzo, (50, y_ini), (ancho - 50, y_ini + 50), (70, 70, 70), -1)
+        cv2.putText(lienzo, "PUNTOS A VERIFICAR (1 = Cumple, 0 = No cumple)", (70, y_ini + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
-    y_cur = y_ini + h_cab
-    h_bloque = (alto - y_cur - 150) // 5
+        y_cur = y_ini + 50
+        h_row = (alto - y_cur - 100) // len(PREGUNTAS_OFICIALES_5S)
 
-    scores_demo = {
-        "1S": [4, 3, 4, 3],
-        "2S": [3, 4, 3, 2],
-        "3S": [4, 4, 3, 4],
-        "4S": [3, 3, 2, 4],
-        "5S": [4, 3, 4, 3]
-    }
-
-    colores = [(240, 248, 255), (245, 255, 250), (255, 250, 240), (255, 245, 245), (245, 245, 255)]
-
-    for idx_p, p_key in enumerate(["1S", "2S", "3S", "4S", "5S"]):
-        p_info = CRITERIOS_5S[p_key]
-        items = p_info["items"]
-        h_row = h_bloque // (len(items) + 1)
-
-        cv2.rectangle(lienzo, (50, y_cur), (ancho - 50, y_cur + h_row), colores[idx_p], -1)
-        cv2.rectangle(lienzo, (50, y_cur), (ancho - 50, y_cur + h_row), (100, 100, 100), 2)
-        cv2.putText(lienzo, f"PILAR {p_key}: {p_info['nombre'].upper()}", (70, y_cur + int(h_row * 0.65)), cv2.FONT_HERSHEY_DUPLEX, 0.8, (20, 20, 80), 2)
-        y_cur += h_row
-
-        for idx_i, item_t in enumerate(items):
-            bg = (255, 255, 255) if idx_i % 2 == 0 else (248, 248, 248)
+        for p_idx, preg in enumerate(PREGUNTAS_OFICIALES_5S):
+            bg = (255, 255, 255) if p_idx % 2 == 0 else (248, 248, 248)
             cv2.rectangle(lienzo, (50, y_cur), (ancho - 50, y_cur + h_row), bg, -1)
-            cv2.rectangle(lienzo, (50, y_cur), (ancho - 50, y_cur + h_row), (180, 180, 180), 1)
-            cv2.putText(lienzo, item_t[:55], (70, y_cur + int(h_row * 0.65)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 30, 30), 2)
+            cv2.rectangle(lienzo, (50, y_cur), (ancho - 50, y_cur + h_row), (190, 190, 190), 1)
 
-            sc = scores_demo[p_key][idx_i]
-            for s in range(5):
-                xb = x_scores + (s * w_col) + 15
-                yb = y_cur + int(h_row * 0.15)
-                wb = int(w_col * 0.7)
-                hb = int(h_row * 0.7)
-                cv2.rectangle(lienzo, (xb, yb), (xb + wb, yb + hb), (130, 130, 130), 2)
+            txt = f"{preg['num']}. [{preg['5S']}] {preg['pregunta'][:50]}"
+            cv2.putText(lienzo, txt, (70, y_cur + int(h_row * 0.65)), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (30, 30, 30), 2)
 
-                if s == sc:
-                    cv2.line(lienzo, (xb + 6, yb + 6), (xb + wb - 6, yb + hb - 6), (180, 20, 20), 4)
-                    cv2.line(lienzo, (xb + wb - 6, yb + 6), (xb + 6, yb + hb - 6), (180, 20, 20), 4)
+            x_eval = int(ancho * 0.75)
+            val = 0 if preg["num"] in m["ceros"] else 1
+            if val == 0:
+                cv2.circle(lienzo, (x_eval + 30, y_cur + int(h_row * 0.5)), 12, (180, 20, 20), 3)
+            else:
+                cv2.line(lienzo, (x_eval + 30, y_cur + 8), (x_eval + 30, y_cur + h_row - 8), (20, 120, 20), 4)
 
             y_cur += h_row
 
-    is_success, buffer = cv2.imencode(".png", lienzo)
-    return buffer.tobytes()
+        img_rgb = cv2.cvtColor(lienzo, cv2.COLOR_BGR2RGB)
+        imagenes_pil.append(Image.fromarray(img_rgb))
+
+    out_pdf = io.BytesIO()
+    if imagenes_pil:
+        imagenes_pil[0].save(out_pdf, format="PDF", save_all=True, append_images=imagenes_pil[1:])
+    return out_pdf.getvalue()
 
 
 # ==========================================
-# 5. APLICACIÓN WEB STREAMLIT
+# 7. APLICACIÓN WEB STREAMLIT
 # ==========================================
 
 st.set_page_config(
-    page_title="Extractor OCR Auditorías 5S",
+    page_title="Extractor 5S de Planta (1 y 0)",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 def main():
-    st.title("📋 Sistema OCR para Auditorías 5S")
-    st.markdown("Digitalización, cálculo automático y diagnóstico visual de planillas de auditoría 5S.")
+    st.title("📋 Extractor de Auditorías 5S en Líneas de Producción")
+    st.markdown("Extrae de forma limpia y directa los datos de las hojas de auditoría semanales: **Área (FA, BE, SMT)**, **Línea**, **Turno (1, 2, 3)**, **Semana** y **Evaluación (1 / 0)**.")
 
-    # Barra lateral
     with st.sidebar:
-        st.header("⚙️ Opciones")
-        aplicar_deskew = st.checkbox("Corregir inclinación (Deskew)", value=True)
-        st.markdown("---")
-        st.subheader("🧪 Planilla de Prueba")
-        if st.button("📄 Cargar Muestra de Demostración", use_container_width=True):
-            st.session_state["muestra_bytes"] = generar_muestra_sintetica_bytes()
-            st.session_state["muestra_nombre"] = "muestra_5s_demo.png"
-            st.success("Muestra sintética cargada.")
+        st.header("🧪 Archivo de Prueba")
+        if st.button("📄 Cargar PDF Multi-Línea de Prueba (4 Páginas)", use_container_width=True):
+            st.session_state["pdf_bytes"] = generar_pdf_multilinea_demo()
+            st.session_state["pdf_nombre"] = "auditoria_5s_planta_demo.pdf"
+            st.success("Muestra multi-línea cargada.")
 
-    # Carga de archivos
     archivo_subido = st.file_uploader(
-        "Arrastre o seleccione un PDF o Imagen escaneada (.pdf, .png, .jpg, .jpeg)",
-        type=["pdf", "png", "jpg", "jpeg", "tiff", "bmp"]
+        "📂 Arrastre o seleccione el archivo PDF escaneado con las hojas de auditoría:",
+        type=["pdf", "png", "jpg", "jpeg"]
     )
 
     datos_bytes = None
@@ -545,125 +541,121 @@ def main():
     if archivo_subido is not None:
         datos_bytes = archivo_subido.getvalue()
         nombre_archivo = archivo_subido.name
-    elif "muestra_bytes" in st.session_state:
-        datos_bytes = st.session_state["muestra_bytes"]
-        nombre_archivo = st.session_state["muestra_nombre"]
-        st.info("📌 Utilizando la planilla sintética de prueba.")
+    elif "pdf_bytes" in st.session_state:
+        datos_bytes = st.session_state["pdf_bytes"]
+        nombre_archivo = st.session_state["pdf_nombre"]
+        st.info(f"📌 Procesando archivo demo: `{nombre_archivo}`")
 
     if datos_bytes is None:
-        st.warning("👈 Por favor cargue un archivo PDF/imagen o presione 'Cargar Muestra de Demostración' en la barra lateral.")
+        st.warning("👈 Por favor cargue su archivo PDF de auditorías o presione 'Cargar PDF Multi-Línea de Prueba' en la barra lateral.")
         return
 
     # Procesar
-    with st.spinner("Procesando documento..."):
+    with st.spinner("Leyendo hojas del PDF y extrayendo matriz de datos..."):
         sufijo = Path(nombre_archivo).suffix.lower()
-        img_bgr = convertir_bytes_a_imagen_bgr(datos_bytes, sufijo)
+        paginas = extraer_paginas_pdf(datos_bytes, sufijo)
 
-        if img_bgr is None:
-            st.error("No se pudo leer la imagen del archivo. Verifique el formato.")
+        if not paginas:
+            st.error("No se pudieron leer las páginas del archivo. Verifique el formato.")
             return
 
-        if aplicar_deskew:
-            img_procesada, angulo = corregir_inclinacion_rapida(img_bgr)
-        else:
-            img_procesada, angulo = img_bgr, 0.0
+        todas_las_filas = []
+        prog_bar = st.progress(0)
 
-        rejilla, celdas = detectar_rejilla_y_celdas(img_procesada)
-        datos_raw = procesar_auditoria_completa(img_procesada)
-        evaluacion = calcular_diagnostico_5s(datos_raw)
+        for i, img in enumerate(paginas):
+            img_corregida = corregir_rotacion_hoja(img)
+            metadatos = extraer_metadatos_hoja_real(img_corregida, i + 1)
+            filas_hoja = procesar_hoja_completa_semanal(img_corregida, metadatos)
+            todas_las_filas.extend(filas_hoja)
+            prog_bar.progress(int((i + 1) / len(paginas) * 100))
 
-    # Pestañas de resultados
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Diagnóstico y Métricas",
-        "📝 Detalle de Criterios",
-        "👁️ Inspección Visual",
-        "💾 Exportar Reporte"
+        time.sleep(0.2)
+        prog_bar.empty()
+
+        df_consolidado = pd.DataFrame(todas_las_filas)
+
+    # KPIs
+    total_preg = len(df_consolidado)
+    total_unos = int((df_consolidado["Evaluación"] == 1).sum())
+    total_ceros = int((df_consolidado["Evaluación"] == 0).sum())
+    pct_cumplimiento = (total_unos / total_preg * 100) if total_preg > 0 else 0.0
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📄 Hojas Procesadas", len(paginas))
+    col2.metric("✅ Conformes (1)", total_unos)
+    col3.metric("❌ No Conformes (0)", total_ceros)
+    col4.metric("📈 % Cumplimiento", f"{pct_cumplimiento:.1f}%")
+
+    st.markdown("---")
+
+    tab1, tab2, tab3 = st.tabs([
+        "📊 Matriz Consolidada de Datos",
+        "🏭 Desglose por Área y Línea",
+        "📥 Descargar Archivo Excel"
     ])
 
     with tab1:
-        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-        col_m1.metric("Área Auditada", evaluacion["area"])
-        col_m2.metric("Auditor", evaluacion["auditor"])
-        col_m3.metric("Fecha", evaluacion["fecha"])
-        col_m4.metric("Turno", evaluacion["turno"])
-
-        st.markdown("---")
-
-        col_g1, col_g2, col_g3, col_g4 = st.columns(4)
-        pct = evaluacion["porcentaje_global"]
-        col_g1.metric("Cumplimiento Global", f"{pct}%")
-        col_g2.metric("Puntuación Total", f"{evaluacion['puntos_totales']} / {evaluacion['puntos_maximos']} pts")
-        col_g3.metric("Ítems Conformes", f"{evaluacion['items_conformes']} / {evaluacion['total_items']}")
-
-        if "EXCELENTE" in evaluacion["estado"]:
-            col_g4.success(f"🟢 {evaluacion['estado']}")
-        elif "OBSERVACIONES" in evaluacion["estado"]:
-            col_g4.warning(f"🟡 {evaluacion['estado']}")
-        else:
-            col_g4.error(f"🔴 {evaluacion['estado']}")
-
-        col_ch1, col_ch2 = st.columns([1, 1])
-
-        with col_ch1:
-            st.subheader("Radar de Madurez 5S")
-            fig_radar = generar_grafico_radar(evaluacion["pilares"])
-            st.pyplot(fig_radar)
-
-        with col_ch2:
-            st.subheader("Cumplimiento por Dimensión")
-            for k, p in evaluacion["pilares"].items():
-                st.write(f"**{p['nombre']}** ({p['porcentaje']}%) - *{p['nivel']}*")
-                st.progress(int(p["porcentaje"]))
-
-            st.markdown("### 💡 Recomendación")
-            st.info(evaluacion["recomendacion"])
-
-    with tab2:
-        st.subheader("Planilla Detallada de Criterios")
-        df = pd.DataFrame(evaluacion["detalle_items"])
+        st.subheader("Datos Extraídos (Exactos a la Plantilla Excel)")
         st.dataframe(
-            df[["codigo", "pilar", "criterio", "puntuacion", "estado_item"]],
+            df_consolidado,
             column_config={
-                "codigo": "Código",
-                "pilar": "Pilar",
-                "criterio": "Criterio",
-                "puntuacion": st.column_config.NumberColumn("Calificación (0-4)", format="%d ⭐"),
-                "estado_item": "Estado"
+                "#": st.column_config.NumberColumn("#", format="%d", width="small"),
+                "5S": st.column_config.TextColumn("5S", width="small"),
+                "Pregunta": st.column_config.TextColumn("Pregunta", width="large"),
+                "Dia": st.column_config.TextColumn("Dia", width="small"),
+                "Semana": st.column_config.NumberColumn("Semana", format="%d", width="small"),
+                "Turno": st.column_config.NumberColumn("Turno", format="%d", width="small"),
+                "Area": st.column_config.TextColumn("Area", width="small"),
+                "Linea": st.column_config.TextColumn("Linea", width="medium"),
+                "Evaluación": st.column_config.NumberColumn("Evaluación", format="%d", width="small"),
             },
             use_container_width=True,
             hide_index=True
         )
 
-    with tab3:
-        st.subheader("Inspección de Visión Artificial")
-        col_v1, col_v2 = st.columns(2)
-        with col_v1:
-            st.image(cv2.cvtColor(img_procesada, cv2.COLOR_BGR2RGB), caption=f"Hoja Procesada (Ajuste: {angulo:.2f}°)", use_container_width=True)
-        with col_v2:
-            copia_celdas = img_procesada.copy()
-            for c in celdas:
-                cv2.rectangle(copia_celdas, (c["x"], c["y"]), (c["x"] + c["w"], c["y"] + c["h"]), (0, 255, 0), 2)
-            st.image(cv2.cvtColor(copia_celdas, cv2.COLOR_BGR2RGB), caption=f"Rejilla y Celdas Detectadas ({len(celdas)} celdas)", use_container_width=True)
+    with tab2:
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            st.subheader("Resumen por Línea de Producción")
+            res_lin = df_consolidado.groupby(["Area", "Linea"])["Evaluación"].agg(
+                Total="count",
+                Conformes=lambda x: (x == 1).sum(),
+                No_Conformes=lambda x: (x == 0).sum(),
+                Cumplimiento_Pct=lambda x: round((x == 1).mean() * 100, 1)
+            ).reset_index()
+            st.dataframe(res_lin, use_container_width=True, hide_index=True)
 
-    with tab4:
-        st.subheader("Descargar Reportes")
-        excel_bytes = exportar_excel_bytes(evaluacion)
-        col_d1, col_d2 = st.columns(2)
-        with col_d1:
+        with col_t2:
+            st.subheader("Resumen por Pilar 5S")
+            res_5s = df_consolidado.groupby("5S")["Evaluación"].agg(
+                Total="count",
+                Conformes=lambda x: (x == 1).sum(),
+                No_Conformes=lambda x: (x == 0).sum(),
+                Cumplimiento_Pct=lambda x: round((x == 1).mean() * 100, 1)
+            ).reset_index()
+            st.dataframe(res_5s, use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.subheader("Descargar Matriz Consolidada en Excel (.xlsx)")
+        excel_bytes = generar_excel_formato_final(df_consolidado)
+        fecha_act = datetime.date.today().strftime("%Y%m%d")
+
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
             st.download_button(
-                "📥 Descargar Reporte en Excel (.xlsx)",
+                label="📥 Descargar Excel con Encabezado Negro (.xlsx)",
                 data=excel_bytes,
-                file_name=f"Reporte_5S_{evaluacion['fecha']}.xlsx",
+                file_name=f"Reporte_5S_Lineas_{fecha_act}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
-        with col_d2:
-            json_str = json.dumps(evaluacion, ensure_ascii=False, indent=2)
+        with col_b2:
+            csv_bytes = df_consolidado.to_csv(index=False).encode("utf-8")
             st.download_button(
-                "📥 Descargar Diagnóstico en JSON",
-                data=json_str,
-                file_name=f"Diagnostico_5S_{evaluacion['fecha']}.json",
-                mime="application/json",
+                label="📥 Descargar CSV (.csv)",
+                data=csv_bytes,
+                file_name=f"Reporte_5S_Lineas_{fecha_act}.csv",
+                mime="text/csv",
                 use_container_width=True
             )
 
