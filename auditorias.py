@@ -2,8 +2,8 @@
 auditorias.py
 =============
 Sistema OCR para Auditorías 5S en Líneas de Producción
-Procesa exclusivamente los archivos PDF escaneados subidos por el usuario.
-Extrae Área (FA, BE, SMT), Línea Real, Semana, Turno (1, 2, 3) y Evaluación (1 y 0).
+Con detección y auto-rotación de hojas escaneadas (0°, 90°, 180°, 270°)
+y extracción exacta de Línea real (WPC 2.5, TRAILER, ICT 5, Flashing InLine, etc.)
 """
 
 from __future__ import annotations
@@ -51,11 +51,11 @@ PREGUNTAS_OFICIALES_5S: List[Dict[str, Any]] = [
 
 
 # ==========================================
-# 2. RASTERIZADOR Y LECTOR DE PDF
+# 2. RASTERIZADOR DE PDF
 # ==========================================
 
 def extraer_paginas_pdf(archivo_bytes: bytes, extension: str) -> List[Tuple[np.ndarray, str]]:
-    """Extrae cada hoja del PDF como imagen para procesamiento visual OCR."""
+    """Extrae las páginas del PDF en memoria."""
     paginas_info: List[Tuple[np.ndarray, str]] = []
     if extension.lower() == ".pdf":
         try:
@@ -95,106 +95,129 @@ def extraer_paginas_pdf(archivo_bytes: bytes, extension: str) -> List[Tuple[np.n
 
 
 # ==========================================
-# 3. EXTRACCIÓN DE METADATOS DEL DOCUMENTO
+# 3. AUTO-ROTACIÓN Y EXTRACCIÓN DE CABECERA
 # ==========================================
 
-def corregir_orientacion(imagen_bgr: np.ndarray) -> np.ndarray:
-    """Corrige la inclinación si la hoja fue escaneada chueca."""
-    try:
-        alto, ancho = imagen_bgr.shape[:2]
-        pequena = cv2.resize(imagen_bgr, (600, int(600 * alto / ancho)))
-        gris = cv2.cvtColor(pequena, cv2.COLOR_BGR2GRAY)
-        _, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-        coords = np.column_stack(np.where(binaria > 0))
-        if len(coords) < 100:
-            return imagen_bgr
+def auto_orientar_hoja(imagen_bgr: np.ndarray) -> np.ndarray:
+    """
+    Detecta si la hoja viene girada (90°, 180°, 270°) y la endereza
+    para que el OCR lea el texto de izquierda a derecha.
+    """
+    import pytesseract
 
-        angulo = cv2.minAreaRect(coords)[-1]
-        if angulo < -45: angulo = -(90 + angulo)
-        elif angulo > 45: angulo = 90 - angulo
-        else: angulo = -angulo
+    palabras_clave = [
+        "PROGRAMA", "PRODUCCION", "PUNTOS", "VERIFICAR",
+        "SELECCION", "ORDEN", "LIMPIEZA", "ESTANDARIZACION",
+        "LUNES", "MARTES", "SEMANA", "LINEA", "AREA", "5S"
+    ]
 
-        if abs(angulo) > 12.0 or abs(angulo) < 0.3:
-            return imagen_bgr
+    rotaciones = [
+        (0, imagen_bgr),
+        (270, cv2.rotate(imagen_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+        (90, cv2.rotate(imagen_bgr, cv2.ROTATE_90_CLOCKWISE)),
+        (180, cv2.rotate(imagen_bgr, cv2.ROTATE_180))
+    ]
 
-        centro = (ancho // 2, alto // 2)
-        matriz = cv2.getRotationMatrix2D(centro, angulo, 1.0)
-        return cv2.warpAffine(imagen_bgr, matriz, (ancho, alto), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-    except Exception:
-        return imagen_bgr
+    mejor_img = imagen_bgr
+    max_score = -1
+
+    for ang, img_rot in rotaciones:
+        try:
+            alto, ancho = img_rot.shape[:2]
+            muestra = img_rot[0:int(alto * 0.35), :]
+            peq = cv2.resize(muestra, (700, int(700 * muestra.shape[0] / muestra.shape[1])))
+            gris = cv2.cvtColor(peq, cv2.COLOR_BGR2GRAY)
+            _, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            txt = pytesseract.image_to_string(binaria, config="--psm 11").upper()
+            
+            score = sum(1 for p in palabras_clave if p in txt)
+            if score > max_score:
+                max_score = score
+                mejor_img = img_rot
+                if score >= 3:
+                    break
+        except Exception:
+            pass
+
+    return mejor_img
 
 
-def ocr_texto_completo(imagen_bgr: np.ndarray) -> str:
-    """Lee el texto impreso en el encabezado de la hoja escaneada."""
-    try:
-        import pytesseract
-        alto = imagen_bgr.shape[0]
-        cabecera = imagen_bgr[0:int(alto * 0.30), :]
-        gris = cv2.cvtColor(cabecera, cv2.COLOR_BGR2GRAY)
-        _, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        
-        t1 = pytesseract.image_to_string(binaria, config="--psm 11")
-        t2 = pytesseract.image_to_string(binaria, config="--psm 6")
-        return t1 + "\n" + t2
-    except Exception:
-        return ""
+def extraer_metadatos_reales(imagen_bgr: np.ndarray, texto_nativo: str, num_pag: int) -> Dict[str, Any]:
+    """
+    Extrae Área, Línea real y Semana del documento escaneado.
+    """
+    import pytesseract
 
+    img_derecha = auto_orientar_hoja(imagen_bgr)
+    alto, ancho = img_derecha.shape[:2]
 
-def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[str, Any]:
-    """Extrae el Área, Línea real y Semana del documento subido por el usuario."""
-    texto_total = texto_nativo + "\n" + ocr_texto_completo(imagen_bgr)
-    
-    # Limpiar título para no confundir con el campo Línea
-    texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5['\s]*S\s+EN\s+L[IÍ]NEAS\s+DE\s+PRODUCCI[OÓ]N", "", texto_total, flags=re.IGNORECASE)
-    texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5S\s+EN\s+LINEAS\s+DE\s+PRODUCCION", "", texto_sin_titulo, flags=re.IGNORECASE)
-    texto_sin_titulo = re.sub(r"PROGRAMA\s+DE\s+5['\s]*S", "", texto_sin_titulo, flags=re.IGNORECASE)
+    cabecera = img_derecha[0:int(alto * 0.30), :]
+    gris = cv2.cvtColor(cabecera, cv2.COLOR_BGR2GRAY)
+    _, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
-    # 1. ÁREA (FA, BE, SMT)
+    texto_ocr = pytesseract.image_to_string(binaria, config="--psm 11") + "\n" + pytesseract.image_to_string(binaria, config="--psm 6")
+    texto_total = texto_nativo + "\n" + texto_ocr
+
+    texto_limpio = re.sub(r"PROGRAMA\s+DE\s+5['\s]*S\s+EN\s+L[IÍ]NEAS\s+DE\s+PRODUCCI[OÓ]N", "", texto_total, flags=re.IGNORECASE)
+    texto_limpio = re.sub(r"PROGRAMA\s+DE\s+5S\s+EN\s+LINEAS\s+DE\s+PRODUCCION", "", texto_limpio, flags=re.IGNORECASE)
+
+    # 1. ÁREA
     area_res = "FA"
-    m_area = re.search(r"(?:[AÁ]rea|Area)\s*[:\-\.]?\s*([A-Za-z0-9\s]{1,6})", texto_sin_titulo, re.IGNORECASE)
+    m_area = re.search(r"(?:[AÁ]rea|Area)\s*[:\-\.]?\s*([A-Za-z0-9\s]{1,6})", texto_limpio, re.IGNORECASE)
     if m_area:
         val_a = m_area.group(1).upper().strip()
         if "BE" in val_a: area_res = "BE"
         elif "SMT" in val_a: area_res = "SMT"
         elif "FA" in val_a: area_res = "FA"
     else:
-        if "BE" in texto_sin_titulo.upper(): area_res = "BE"
-        elif "SMT" in texto_sin_titulo.upper(): area_res = "SMT"
-        elif "FA" in texto_sin_titulo.upper(): area_res = "FA"
+        if "BE" in texto_limpio.upper(): area_res = "BE"
+        elif "SMT" in texto_limpio.upper(): area_res = "SMT"
+        elif "FA" in texto_limpio.upper(): area_res = "FA"
 
     # 2. LÍNEA REAL
     linea_res = ""
-    nombres_lineas_planta = [
-        "WPC 2.5", "TRAILER", "ICT 5", "Flashing InLine", "Flashing Inline",
-        "CONFORMAL 1", "CONFORMAL 2", "CONFORMAL 3",
-        "SMT 1", "SMT 2", "SMT 3", "SMT 4", "SMT 5",
-        "ENSAMBLE 1", "ENSAMBLE 2", "ENSAMBLE 3", "TESTING 1", "TESTING 2"
+
+    lineas_conocidas = [
+        ("wpc", "WPC 2.5"),
+        ("trailer", "TRAILER"),
+        ("ict 5", "ICT 5"),
+        ("ict5", "ICT 5"),
+        ("flashing", "Flashing InLine"),
+        ("inline", "Flashing InLine"),
+        ("conformal 1", "CONFORMAL 1"),
+        ("conformal 2", "CONFORMAL 2"),
+        ("conformal", "CONFORMAL 1"),
+        ("smt 1", "SMT 1"),
+        ("smt 2", "SMT 2"),
+        ("smt 3", "SMT 3"),
+        ("smt", "SMT")
     ]
-    for lin in nombres_lineas_planta:
-        if lin.lower() in texto_sin_titulo.lower():
-            linea_res = lin
+    
+    for clave, nombre_oficial in lineas_conocidas:
+        if clave in texto_limpio.lower():
+            linea_res = nombre_oficial
             break
 
     if not linea_res:
-        m_linea = re.search(r"(?:L[ií1l]nea|Line)\s*[:\-\.]?\s*([A-Za-z0-9\.\-\_\s]+?)(?=\s*(?:Semana|Fecha|Turno|Area|[AÁ]rea|Ref|\||\n|$))", texto_sin_titulo, re.IGNORECASE)
-        if m_linea:
-            cand = m_linea.group(1).strip()
-            cand = re.sub(r"^(?:de|en|del)\s+", "", cand, flags=re.IGNORECASE).strip()
-            if len(cand) >= 2 and cand.lower() not in ["de produccion", "de producción", "de", "en", "s area"]:
-                linea_res = cand
+        m_lin = re.search(r"(?:L[ií1l]nea|Line)\s*[:\-\.]\s*([A-Za-z0-9\.\-\_\s]{2,20})", texto_limpio, re.IGNORECASE)
+        if m_lin:
+            c = m_lin.group(1).strip()
+            c = re.sub(r"^(?:de|en|del)\s+", "", c, flags=re.IGNORECASE).strip()
+            if len(c) >= 2 and c.lower() not in ["de", "en", "produccion", "producción"]:
+                linea_res = c
 
     if not linea_res:
-        linea_res = "Línea Principal"
+        linea_res = f"Pág {num_pag}"
 
     # 3. SEMANA
     semana_res = 31
-    m_sem = re.search(r"(?:Semana|Week|Sem)\s*[:\-\.]?\s*([0-9]{1,2})", texto_sin_titulo, re.IGNORECASE)
+    m_sem = re.search(r"(?:Semana|Week|Sem)\s*[:\-\.]?\s*([0-9]{1,2})", texto_limpio, re.IGNORECASE)
     if m_sem:
         semana_res = int(m_sem.group(1))
 
-    # 4. FECHA BASE (LUNES)
+    # 4. FECHA BASE
     fecha_res = "7/27/2026"
-    m_fec = re.search(r"([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})", texto_sin_titulo)
+    m_fec = re.search(r"([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})", texto_limpio)
     if m_fec:
         fecha_res = m_fec.group(1).replace("-", "/").replace(".", "/")
 
@@ -202,16 +225,17 @@ def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[
         "Area": area_res,
         "Linea": linea_res,
         "Semana": semana_res,
-        "FechaBase": fecha_res
+        "FechaBase": fecha_res,
+        "ImagenDerecha": img_derecha
     }
 
 
 # ==========================================
-# 4. MATRIZ DE EVALUACIÓN (DETECCIÓN DE 1 Y 0)
+# 4. MATRIZ DE PREGUNTAS (1 Y 0)
 # ==========================================
 
 def detectar_1_o_0(recorte: np.ndarray) -> Optional[int]:
-    """Analiza visualmente la celda para detectar trazo de 1 o círculo de 0."""
+    """Detecta si en la celda se marcó 1 o 0."""
     if recorte is None or recorte.size == 0:
         return None
     gris = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY) if len(recorte.shape) == 3 else recorte
@@ -246,7 +270,7 @@ def detectar_1_o_0(recorte: np.ndarray) -> Optional[int]:
 
 
 def procesar_hoja_evaluaciones(imagen_bgr: np.ndarray, metadatos: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Procesa la cuadrícula de días y turnos de la hoja subida."""
+    """Procesa la cuadrícula de días y turnos de la hoja."""
     alto, ancho = imagen_bgr.shape[:2]
     filas = []
 
@@ -403,12 +427,15 @@ def main():
             return
 
         todas_las_filas = []
+        paginas_orientadas = []
         prog_bar = st.progress(0)
 
         for i, (img, texto_nativo) in enumerate(paginas_info):
-            img_corregida = corregir_orientacion(img)
-            metadatos = extraer_metadatos_pagina(img_corregida, texto_nativo)
-            filas_hoja = procesar_hoja_evaluaciones(img_corregida, metadatos)
+            metadatos = extraer_metadatos_reales(img, texto_nativo, i + 1)
+            img_derecha = metadatos["ImagenDerecha"]
+            paginas_orientadas.append(img_derecha)
+            
+            filas_hoja = procesar_hoja_evaluaciones(img_derecha, metadatos)
             todas_las_filas.extend(filas_hoja)
             prog_bar.progress(int((i + 1) / len(paginas_info) * 100))
 
@@ -506,7 +533,7 @@ def main():
     with tab4:
         st.subheader("Comprobación Visual de Páginas Escaneadas")
         st.info("Aquí puedes verificar visualmente las hojas escaneadas de tu archivo PDF.")
-        for idx, (img_bgr, _) in enumerate(paginas_info):
+        for idx, img_bgr in enumerate(paginas_orientadas):
             st.write(f"**Página {idx + 1} del documento:**")
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             st.image(img_rgb, use_container_width=True)
