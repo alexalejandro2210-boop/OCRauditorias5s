@@ -94,7 +94,7 @@ def extraer_paginas_pdf(archivo_bytes: bytes, extension: str) -> List[Tuple[np.n
 
 
 # ==========================================
-# 3. EXTRACCIÓN ROBUSTA DE ÁREA, LÍNEA Y SEMANA
+# 3. EXTRACCIÓN DE METADATOS
 # ==========================================
 
 def corregir_orientacion(imagen_bgr: np.ndarray) -> np.ndarray:
@@ -156,7 +156,7 @@ def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[
         elif "SMT" in texto_total.upper(): area_res = "SMT"
         elif "FA" in texto_total.upper(): area_res = "FA"
 
-    # 2. LÍNEA REAL (Extracción precisa sin nombres genéricos)
+    # 2. LÍNEA REAL
     linea_res = ""
     m_linea = re.search(r"(?:L[ií1l]nea|Linea|Line)\s*[:\-\.]?\s*([A-Za-z0-9\.\-\_\s]{2,25})", texto_total, re.IGNORECASE)
     if m_linea:
@@ -186,7 +186,7 @@ def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[
     if m_sem:
         semana_res = int(m_sem.group(1))
 
-    # 4. FECHA BASE (LUNES)
+    # 4. FECHA BASE
     fecha_res = "7/27/2026"
     m_fec = re.search(r"([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})", texto_total)
     if m_fec:
@@ -205,7 +205,7 @@ def extraer_metadatos_pagina(imagen_bgr: np.ndarray, texto_nativo: str) -> Dict[
 # ==========================================
 
 def detectar_1_o_0(recorte: np.ndarray) -> Optional[int]:
-    """Detecta si la celda tiene un 1 (trazo vertical) o un 0 (círculo)."""
+    """Detecta si la celda tiene un 1 o un 0."""
     if recorte is None or recorte.size == 0:
         return None
     gris = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY) if len(recorte.shape) == 3 else recorte
@@ -240,7 +240,7 @@ def detectar_1_o_0(recorte: np.ndarray) -> Optional[int]:
 
 
 def procesar_hoja_evaluaciones(imagen_bgr: np.ndarray, metadatos: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Procesa la cuadrícula completa de días y turnos (1, 2, 3)."""
+    """Procesa la cuadrícula de días y turnos."""
     alto, ancho = imagen_bgr.shape[:2]
     filas = []
 
@@ -250,7 +250,7 @@ def procesar_hoja_evaluaciones(imagen_bgr: np.ndarray, metadatos: Dict[str, Any]
 
     x_ini = int(ancho * 0.38)
     x_fin = int(ancho * 0.98)
-    total_cols = 18  # 6 días x 3 turnos
+    total_cols = 18
     ancho_col = (x_fin - x_ini) // total_cols
 
     try:
@@ -265,7 +265,7 @@ def procesar_hoja_evaluaciones(imagen_bgr: np.ndarray, metadatos: Dict[str, Any]
 
     for idx_col in range(total_cols):
         idx_dia = idx_col // 3
-        num_turno = (idx_col % 3) + 1  # 1, 2 o 3
+        num_turno = (idx_col % 3) + 1
 
         fecha_dia = fecha_lunes + datetime.timedelta(days=idx_dia)
         dia_str = fecha_dia.strftime("%m/%d/%Y").lstrip("0").replace("/0", "/")
@@ -420,25 +420,25 @@ def generar_pdf_demo() -> bytes:
 # ==========================================
 
 st.set_page_config(
-    page_title="Extractor 5S de Planta",
+    page_title="Extractor de Auditorías 5S",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 def main():
-    st.title("📋 Extractor de Auditorías 5S en Líneas de Producción")
-    st.markdown("Extrae los datos reales de las hojas impresas: **Área (FA, BE, SMT)**, **Línea Real**, **Semana**, **Turno (1, 2, 3)** y la matriz de evaluaciones **1 / 0**.")
+    st.title("📋 Extractor de Auditorías 5S")
+    st.markdown("Digitalización y consolidación automática de auditorías en líneas de producción.")
 
     with st.sidebar:
-        st.header("🧪 Archivo de Prueba")
-        if st.button("📄 Cargar Muestra con Líneas Reales (WPC 2.5, TRAILER, ICT 5, Flashing InLine)", use_container_width=True):
+        st.header("⚡ Opciones")
+        if st.button("✨ Cargar archivo de ejemplo", use_container_width=True):
             st.session_state["pdf_bytes"] = generar_pdf_demo()
-            st.session_state["pdf_nombre"] = "demo_lineas_reales.pdf"
-            st.success("Muestra multi-línea cargada.")
+            st.session_state["pdf_nombre"] = "auditorias_ejemplo.pdf"
+            st.success("Archivo de ejemplo cargado exitosamente.")
 
     archivo_subido = st.file_uploader(
-        "📂 Arrastre o seleccione el archivo PDF de auditorías escaneadas:",
+        "📥 Arrastre archivos de auditorías para realizar la extracción de la información (.pdf)",
         type=["pdf", "png", "jpg", "jpeg"]
     )
 
@@ -451,13 +451,13 @@ def main():
     elif "pdf_bytes" in st.session_state:
         datos_bytes = st.session_state["pdf_bytes"]
         nombre_archivo = st.session_state["pdf_nombre"]
-        st.info(f"📌 Procesando archivo demo: `{nombre_archivo}`")
+        st.info(f"📌 Procesando archivo: `{nombre_archivo}`")
 
     if datos_bytes is None:
-        st.warning("👈 Por favor cargue su archivo PDF de auditorías o presione 'Cargar Muestra con Líneas Reales' en la barra lateral.")
+        st.warning("👈 Arrastre o seleccione un archivo PDF de auditorías para comenzar.")
         return
 
-    with st.spinner("Leyendo hojas del PDF y extrayendo matriz de datos..."):
+    with st.spinner("Extrayendo información de las auditorías..."):
         sufijo = Path(nombre_archivo).suffix.lower()
         paginas_info = extraer_paginas_pdf(datos_bytes, sufijo)
 
@@ -495,13 +495,13 @@ def main():
     st.markdown("---")
 
     tab1, tab2, tab3 = st.tabs([
-        "📋 Matriz Consolidada de Datos",
-        "🏭 Desglose por Área y Línea",
-        "📥 Descargar Archivo Excel"
+        "📋 Matriz Consolidada",
+        "🏭 Resumen por Línea",
+        "📥 Descargar Excel"
     ])
 
     with tab1:
-        st.subheader("Datos Extraídos (Exactos a la Plantilla Excel)")
+        st.subheader("Datos Extraídos")
         df_editado = st.data_editor(
             df_consolidado,
             column_config={
@@ -522,7 +522,7 @@ def main():
     with tab2:
         col_t1, col_t2 = st.columns(2)
         with col_t1:
-            st.subheader("Resumen por Línea de Producción")
+            st.subheader("Resumen por Línea")
             res_lin = df_editado.groupby(["Area", "Linea"])["Evaluación"].agg(
                 Total="count",
                 Conformes=lambda x: (x == 1).sum(),
@@ -551,7 +551,7 @@ def main():
             st.download_button(
                 label="📥 Descargar Excel con Encabezado Negro (.xlsx)",
                 data=excel_bytes,
-                file_name=f"Reporte_5S_Lineas_{fecha_act}.xlsx",
+                file_name=f"Reporte_5S_{fecha_act}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
@@ -560,7 +560,7 @@ def main():
             st.download_button(
                 label="📥 Descargar CSV (.csv)",
                 data=csv_bytes,
-                file_name=f"Reporte_5S_Lineas_{fecha_act}.csv",
+                file_name=f"Reporte_5S_{fecha_act}.csv",
                 mime="text/csv",
                 use_container_width=True
             )
